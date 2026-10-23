@@ -148,6 +148,11 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_fila_prioridade ON fila(prioridade DESC, criado_em);
         """)
         conn.execute(f"PRAGMA user_version={VERSAO_SCHEMA}")
+        # regra nova vale p/ o que já está no banco: todo início (= todo deploy)
+        # reavalia tudo em silêncio (~1 ms cada; a faxina diária mantém o banco
+        # pequeno). Antes ficava o veredito velho, inclusive no histórico do painel
+        conn.execute("""INSERT OR IGNORE INTO fila (anuncio_id, busca_id, prioridade)
+                        SELECT id, busca_id, -1 FROM anuncios""")
 
 
 def _migrar_v1(conn):

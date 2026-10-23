@@ -69,6 +69,6 @@ para aceitar só conexões da própria máquina). Segredos ficam só no `.env`
 ## Testes
 
 ```bash
-./venv/bin/python test_offline.py      # 66 testes de regressão (não usam rede nem o banco real)
+./venv/bin/python test_offline.py      # 67 testes de regressão (não usam rede nem o banco real)
 ./venv/bin/python test_live_olx.py     # canário contra a OLX real (layout, RSC, ordem)
 ```

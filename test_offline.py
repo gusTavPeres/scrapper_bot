@@ -1879,6 +1879,22 @@ def test_p9_alertas_contidos():
     assert n2.resumos and all(not r["cats"] for r in n2.resumos), n2.resumos
 
 
+def test_p9_regra_nova_reavalia_o_banco():
+    """Veredito antigo (regra velha aprovou uma 5070 na busca da 3090) é
+    refeito no próximo início, sem notificar."""
+    novo_banco()
+    bid = criar()
+    aid, _, _ = db.upsert_anuncio(bid, {"url": "https://x/a-4000001", "list_id": 4000001,
+                                        "titulo": "ASUS 5070 PRIME 12GB IGUAL 4070S 3080 3090 4060", "preco": 3000})
+    db.salvar_analise(aid, {**avaliar(_item(), []), "decisao": "APROVADO"})
+    sql("UPDATE anuncios SET ultima_vez=datetime('now','-40 days')")     # expirado também
+    db.init_db()
+    n = NotifierFalso()
+    rodar(avaliador.processar_fila(n))
+    assert sql("SELECT decisao FROM analises WHERE anuncio_id=?", aid)[0][0] == "EXCLUIDO"
+    assert not n.enviados and not n.resumos
+
+
 def test_fd_leak():
     if not os.path.isdir("/proc/self/fd"):          # só Linux tem /proc
         return
