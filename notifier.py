@@ -149,12 +149,17 @@ async def enviar_queda(busca: dict, anuncio: dict, preco_antigo: float, anuncio_
 
 
 async def enviar_resumo(busca_id: int, r: dict) -> bool:
-    return await asyncio.to_thread(
-        _enviar,
-        f"📊 <b>{esc(r['nome'])}</b> — {r['n']} anúncios avaliados\n"
-        f"🟢 COMPRAR: {r['comprar']} · 🟡 VER: {r['ver']} · "
-        f"🔴 ignorados: {r['n'] - r['comprar'] - r['ver']}\n"
-        f"Detalhes: /top {busca_id}")
+    texto = (f"📊 <b>{esc(r['nome'])}</b> — {r['n']} anúncios avaliados\n"
+             f"🟢 COMPRAR: {r['comprar']} · 🟡 VER: {r['ver']} · "
+             f"🔴 ignorados: {r['n'] - r['comprar'] - r['ver']}\n")
+    if r.get("sem_alerta"):
+        texto += f"🔕 Mais {r['sem_alerta']} oportunidade(s) sem alerta (limite por rodada)\n"
+    if r.get("cats"):
+        cats = sorted(r["cats"].items(), key=lambda x: -x[1])
+        texto += (f"🗂 Vieram de {len(cats)} categorias: "
+                  + ", ".join(f"{esc(c)} ({n})" for c, n in cats[:4])
+                  + f"\nPara ficar só com as que interessam: /categorias {busca_id}\n")
+    return await asyncio.to_thread(_enviar, texto + f"Detalhes: /top {busca_id}")
 
 
 _ultimo_alerta: dict[str, float] = {}

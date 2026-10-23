@@ -1798,6 +1798,87 @@ def test_p8_termo_e_texto_seguros():
     assert db.listar_buscas() == []
 
 
+def test_p9_buscas_de_outras_categorias():
+    """Achados rodando buscas reais fora de GPU (civic, cg 160, ps5, imóveis)."""
+    casos = [  # (termo, título, deve passar?)
+        ("ps5", "NINTENDO SWITCH OLED 256GB", False), ("ps5", "Vendo dois ps4 slim e fat", False),
+        ("ps5", "PS5 C/ Mídia Física 1TB", True), ("ps5", "Playstation 5 slim", True),
+        ("ps5", "PS4 + 5 jogos", False), ("ps5", "PS5 Pro 2TB", False),
+        ("iphone 8", "iPhone 8 64gb", True), ("iphone 8", "iPhone 11 com 8gb", False),
+        ("memoria ddr4 8gb", "Memória DDR4 8GB 3200", True), ("memoria ddr4 8gb", "Memória DDR4 16GB", False),
+        ("macbook air m1", "MacBook Air M2", False), ("linea 1.9", "Fiat Linea 1.9 16v", True),
+        ("cg 160", "CG 160cc Start - 2021 Impecável", True), ("i7 12700", "i7 12700K", False),
+        ("geladeira 400 litros", "Geladeira Brastemp 400L", True),
+        ("civic", "Lanterna Honda Civic 1996", False), ("civic", "Friso Direito Teto Honda New Civic", False),
+        ("civic", "Honda Civic Sedan EX 2.0 Flex 2019", True),
+        ("bicicleta aro 29", "Roda aro 29 bicicleta", False), ("notebook dell", "Tela notebook dell 15.6", False),
+        ("ps5", "joystick dualsense ps5", False),
+        ("lancha", "Tinta anticrustante WEG para barcos, lanchas e veleiros", False),
+        ("iphone 13", "Película p/ iPhone 13", False), ("lancha", "Vendo lancha para pesca", True),
+        ("notebook dell", "Notebook Dell Vostro 15 3515 Ryzen 5 8GB", True),
+        ("pc gamer", "PC Gamer Ryzen 5 RTX 3060", True), ("rtx 3060", "PC Gamer Ryzen 5 RTX 3060", False),
+        ("ryzen 5 5600", "PC Gamer Ryzen 5 5600 RTX 3060", False),
+    ]
+    erros = [(t, ti, ok) for t, ti, ok in casos if produto_bate(t, ti)[0] != ok]
+    assert not erros, erros
+    # título que nem cita o modelo: vale o campo Modelo da OLX (só nesse caso)
+    assert avaliador.identidade("cg 160", {"titulo": "Venda", "atributos": "Modelo: CG 160 Titan · Ano: 2016"})[0]
+    assert not avaliador.identidade("cg 160", {"titulo": "Cg 150", "atributos": "Modelo: CG 150 Titan"})[0]
+    assert not avaliador.identidade("cg 160", {"titulo": "Banco cg 160", "atributos": "Modelo: CG 160"})[0]
+    assert avaliador.identidade("notebook dell", {"titulo": "Dell Latitude i5", "categoria": "Notebooks"})[0]
+    assert not avaliador.identidade("ps5", {"titulo": "God of War Ragnarok", "categoria": "Jogos de Vídeo Game",
+                                            "atributos": "Marca do Console: Sony · Modelo: Playstation 5"})[0]
+    assert not avaliador.identidade("notebook dell", {"titulo": "Dell Latitude i5", "categoria": "Monitores"})[0]
+    # moto/caminhão (Ano: da OLX) compara com o mesmo ano; produto ignora ano no título
+    comps = [{"id": i, "titulo": "Honda CG 160", "atributos": f"Ano: {2017 if i < 6 else 2025}",
+              "preco": 11000 if i < 6 else 20000, "categoria": "Motos"} for i in range(12)]
+    assert avaliador.referencia_preco({"anuncio_id": 0, "atributos": "Ano: 2017", "categoria": "Motos"}, comps) == (11000, 5)
+    assert avaliador.referencia_preco({"anuncio_id": 0, "titulo": "RTX 3090 de 2023", "atributos": "",
+                                       "categoria": "Motos"}, comps)[0] == 20000
+    # imóvel: venda e aluguel em categorias separadas
+    ad = anuncio_olx(1, "Apto 2 quartos", 1500, properties=[
+        {"name": "category", "label": "Categoria", "value": "Apartamentos"},
+        {"name": "real_estate_type", "label": "Tipo", "value": "Aluguel - apartamento padrão"}], category="Apartamentos")
+    assert scheduler._mapear_flight_ad(ad)["categoria"] == "Apartamentos (aluguel)"
+    assert scheduler._mapear_flight_ad(anuncio_olx(2, "Apto", 9, category="Apartamentos"))["categoria"] == "Apartamentos"
+
+
+def test_p9_alertas_contidos():
+    """Busca ampla: no máximo MAX_ALERTAS por passada (os melhores), alerta só
+    com a descrição baixada e, no 1º scan, dica de /categorias se misturou."""
+    novo_banco()
+    bid = criar(termo="rtx 5060", preco_max=2000)
+    ids = []
+    for i in range(8):
+        aid, _, _ = db.upsert_anuncio(bid, {"url": f"https://x/a-{3000000 + i}", "list_id": 3000000 + i,
+                                            "titulo": f"RTX 5060 n{i}", "preco": 1500 + 10 * i,
+                                            "categoria": "Placas" if i % 2 else "Componentes"})
+        if i < 7:
+            db.atualizar_descricao(aid, bid, _item()["descricao"])
+        else:
+            db.adicionar_fila(aid, bid, 1)                 # descrição ainda não baixada
+        ids.append(aid)
+    n = NotifierFalso()
+    rodar(avaliador.processar_fila(n))
+    assert len(n.enviados) == avaliador.MAX_ALERTAS and ids[7] not in n.enviados, n.enviados
+    r = n.resumos[0]
+    assert r["sem_alerta"] == 2 and r["cats"] == {"Componentes": 4, "Placas": 4}, r
+    texto = []
+    notifier._enviar = lambda t: texto.append(t) or True
+    rodar(notifier.enviar_resumo(bid, r))
+    assert "2 oportunidade(s) sem alerta" in texto[0] and f"/categorias {bid}" in texto[0]
+    db.atualizar_descricao(ids[7], bid, _item()["descricao"])      # chegou: agora alerta
+    rodar(avaliador.processar_fila(n))
+    assert n.enviados[-1] == ids[7]
+    sql("UPDATE buscas SET categorias='[\"Placas\"]'")              # já filtrada: sem dica
+    db.atualizar_descricao(ids[6], bid, _item()["descricao"] + " ")
+    for aid in ids[:6]:
+        db.adicionar_fila(aid, bid, 1)
+    n2 = NotifierFalso()
+    rodar(avaliador.processar_fila(n2))
+    assert n2.resumos and all(not r["cats"] for r in n2.resumos), n2.resumos
+
+
 def test_fd_leak():
     if not os.path.isdir("/proc/self/fd"):          # só Linux tem /proc
         return

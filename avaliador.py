@@ -7,7 +7,7 @@ resto também é determinístico:
   1. identidade: é o produto buscado? (modelo, sufixo, PC/notebook, acessório)
   2. exclusões do usuário (critérios + "sem X"/"nada de X" nas instruções)
   3. sinais no texto: defeito, golpe, procedência (nota, garantia, caixa)
-  4. preço vs MEDIANA dos anúncios comparáveis (mesmo produto; carro: mesmo ano)
+  4. preço vs MEDIANA dos anúncios comparáveis (mesmo produto; veículo: mesmo ano)
 Texto negado não conta: "sem defeito", "nunca foi usada em mineração".
 Limite: instruções livres viram palavras-chave ("só com X" exige, "prefiro X"
 pontua); números ("acima de 2015") ficam p/ as opções ano=/km=/min=/max=.
@@ -91,7 +91,9 @@ def _todos_afirmados(texto: str, radicais: list[str]) -> bool:
 # (busca "rtx 3090" -> aprovava RTX 5070/5060 Ti). É checagem de regex.
 
 _SUFIXOS = {"ti", "super", "xt", "xtx", "gre", "pro", "max", "plus", "ultra", "mini", "lite"}
-_UNIDADES = {"gb", "tb", "mb", "mhz", "ghz", "hz", "w", "v", "fe", "oc", "mm", "pol"}
+_UNIDADES = {"gb", "tb", "mb", "mhz", "ghz", "hz", "w", "v", "fe", "oc", "mm", "pol", "polegadas",
+             "cc", "cil", "cv", "hp", "km", "kg", "ml", "l", "litros", "cm", "mah", "mp",
+             "rpm", "fps", "bit", "bits", "btu", "btus", "kw", "kva"}
 # "CPU gamer" no Brasil = o PC inteiro; processador antes do produto = montagem
 _CONJUNTOS = ("notebook", "laptop", "computador", "pc", "kit", "workstation", "setup completo",
               "cpu gamer", "cpu completa", "maquina gamer", "maquina para", "maquina completa",
@@ -102,7 +104,16 @@ _PREPOSICOES = {"para", "pra", "p", "de", "do", "da", "no", "na", "meu", "minha"
 # antes do produto no título = é o item principal: "Waterblock EK para RTX 3090"
 _ACESSORIOS = ("capa", "capinha", "pelicula", "case", "cabo", "suporte", "waterblock",
                "water block", "backplate", "cooler", "adaptador", "carregador", "fonte",
-               "riser", "bracket", "dock", "controle", "bateria", "carcaca", "caixa", "chip")
+               "riser", "bracket", "dock", "controle", "bateria", "carcaca", "caixa", "chip",
+               "joystick", "dualsense", "headset", "skin", "tela", "teclado", "mouse", "placa mae",
+               # peças de carro/moto/bike: "Lanterna Honda Civic", "Roda aro 29 bicicleta"
+               "farol", "farois", "lanterna", "friso", "dobradica", "porta", "parachoque",
+               "para-choque", "para choque", "retrovisor", "roda", "pneu", "motor", "cambio",
+               "volante", "banco", "grade", "paralama", "capo", "tampa", "macaneta", "amortecedor",
+               "radiador", "alternador", "embreagem", "modulo", "central", "sensor", "bomba",
+               "pastilha", "disco", "calota", "spoiler", "aerofolio", "moldura", "tapete",
+               "vidro", "lente", "chave", "painel", "escapamento", "ponteira", "carburador",
+               "tanque", "carenagem", "guidao", "bauleto", "cilindro", "pedal", "selim", "quadro")
 # marca sozinha não identifica: "fiat linea" não pode aceitar "Fiat Palio"
 _MARCAS = {"fiat", "chevrolet", "volkswagen", "ford", "toyota", "honda", "hyundai",
            "renault", "nissan", "peugeot", "citroen", "jeep", "mitsubishi", "chery",
@@ -134,6 +145,12 @@ def _sufixos(ti: str, num: str, inicio: int) -> frozenset:
     return frozenset(out)
 
 
+def _unidade_apos(texto: str, fim: int) -> str:
+    """Unidade logo após um número: '8gb', '8 gb' -> 'gb' ('' se não houver)."""
+    m = re.match(r"\s?([a-z]+)", texto[fim:])
+    return m.group(1) if m and m.group(1) in _UNIDADES else ""
+
+
 _CONECTIVOS = {"com", "de", "do", "da", "dos", "das", "para", "pra", "sem", "e", "o", "a",
                "em", "no", "na", "p", "c"}
 
@@ -161,11 +178,16 @@ def produto_bate(termo: str, titulo: str) -> tuple[bool, str]:
     if not t.strip():
         return True, ""                       # carro sem modelo: categoria toda
     posicoes = []
-    for num in re.findall(r"\d{2,}", t):
-        ocorr = [m.start() for m in re.finditer(rf"(?<!\d){num}(?!\d)", ti)]
+    # decimais ("1.9", "2.0") não identificam; 1 dígito ("ps5", "iphone 8") só
+    # colado/junto de palavra: "PS4 + 5 jogos" não é PS5
+    for num in re.findall(r"(?<![\d.,])\d+(?![.,]?\d)", t):
+        m_t = re.search(rf"(?<!\d){num}(?!\d)", t)
+        un = _unidade_apos(t, m_t.end())       # "8gb" na busca = memória, não modelo
+        ocorr = [m.start() for m in re.finditer(rf"(?<!\d){num}(?!\d)", ti)
+                 if len(num) > 1 or (_unidade_apos(ti, m.end()) == un
+                                     and (un or re.search(r"[a-z][\s-]?$", ti[:m.start()])))]
         if not ocorr:
             return False, f"título não menciona '{num}' (modelo diferente)"
-        m_t = re.search(rf"(?<!\d){num}(?!\d)", t)
         quer = _sufixos(t, num, m_t.start())
         tem = [_sufixos(ti, num, i) for i in ocorr]
         # "RTX 4080/4090/5090", "(5060, 5070, 5080)": vários modelos no título
@@ -195,17 +217,23 @@ def produto_bate(termo: str, titulo: str) -> tuple[bool, str]:
     if especificas and not posicoes and not any(p in ti for p in especificas):
         return False, f"só a marca bate; título não menciona {', '.join(especificas[:3])}"
     # "RTX 3080 (melhor CxB entre 5050 5060 4060 4070 e 5070)": lista de modelos
-    nums_termo = set(re.findall(r"\d{2,}", t))
+    nums_termo = set(re.findall(r"\d+", t))
     if nums_termo and len(set(re.findall(r"(?<!\d)\d{4}(?!\d)", ti)) - nums_termo) >= 3:
         return False, "título lista vários modelos"
     posicoes += [ti.find(p) for p in re.findall(r"[a-z0-9]{2,}", t) if p in ti]
     pos_produto = min(posicoes) if posicoes else 0
+    # "Tinta para barcos, lanchas", "Película p/ iPhone 13": é item PARA o produto
+    if re.search(r"\b(?:para|pra|p)\b\W+(?:[a-z0-9]+\W+){0,2}$", ti[:pos_produto]):
+        return False, "anúncio de item PARA o produto, não do produto"
 
     for frase in _SO_ACESSORIO:
         if frase in ti and frase not in t:
             return False, f"anúncio de '{frase}', não do produto"
+    # busca de máquina inteira ("notebook dell", "pc gamer"): o processador
+    # descreve o próprio produto, não é montagem
+    sistema = re.search(r"(?<![a-z0-9])(notebook|laptop|computador|pc|workstation|servidor)(?![a-z0-9])", t)
     for pal in _CONJUNTOS:
-        if pal in t:
+        if pal in t or (sistema and pal in ("ryzen", "xeon")):
             continue
         for m in re.finditer(rf"(?<![a-z0-9]){pal}(?![a-z0-9])", ti):
             antes = re.findall(r"[a-z]+", ti[max(0, m.start() - 20):m.start()])[-2:]
@@ -220,10 +248,28 @@ def produto_bate(termo: str, titulo: str) -> tuple[bool, str]:
     return True, ""
 
 
+def identidade(termo: str, anuncio: dict) -> tuple[bool, str]:
+    """produto_bate no título; se o título nem cita o produto ("Venda", "Moto
+    top"), vale o campo Modelo da OLX — só em VEÍCULO (tem "Ano:"): em jogo e
+    acessório o Modelo é a plataforma ("God of War" -> Modelo: Playstation 5).
+    Só a marca no título + o resto na categoria também vale: "Dell Latitude i5"
+    em Notebooks."""
+    titulo, cat = anuncio.get("titulo") or "", anuncio.get("categoria") or ""
+    atrib = anuncio.get("atributos") or ""
+    ok, motivo = produto_bate(termo, titulo)
+    if not ok and "não menciona" in motivo:
+        m = re.search(r"(?:^|· )Modelo: ([^·]+)", atrib)
+        if m and re.search(r"(?:^|· )Ano: ", atrib) and produto_bate(termo, m.group(1))[0]:
+            return True, ""
+        if motivo.startswith("só a marca") and cat and produto_bate(termo, f"{titulo} · {cat}")[0]:
+            return True, ""
+    return ok, motivo
+
+
 def triagem(busca: dict, anuncio: dict) -> tuple[bool, str]:
     """Filtro barato da ENTRADA (antes de baixar descrição): identidade +
     categorias da OLX escolhidas pelo usuário (vazio = todas)."""
-    ok, motivo = produto_bate(busca.get("termo") or "", anuncio.get("titulo") or "")
+    ok, motivo = identidade(busca.get("termo") or "", anuncio)
     if not ok:
         return False, f"Checagem de modelo: {motivo}"
     cats, cat = _lista(busca.get("categorias")), anuncio.get("categoria") or ""
@@ -400,10 +446,12 @@ def _lista(v) -> list[str]:
 
 # ── 4. PREÇO ──────────────────────────────────────────────
 
-def ano_do_anuncio(d: dict):
+def ano_do_anuncio(d: dict, so_atributo: bool = False):
     m = re.search(r"\bano[^:·]{0,10}:\s*((?:19|20)\d{2})", norm(d.get("atributos") or ""))
     if m:
         return int(m.group(1))
+    if so_atributo:              # produto: ano no título é "comprada em 2023", não modelo
+        return None
     anos = re.findall(r"\b(19[5-9]\d|20[0-4]\d)\b", d.get("titulo") or "")
     return int(anos[-1]) if anos else None
 
@@ -418,7 +466,7 @@ def tem_defeito(d: dict, tipo: str) -> bool:
 
 def referencia_preco(item: dict, comparaveis: list[dict]) -> tuple[float | None, int]:
     """(mediana, n) dos comparáveis (identidade já filtrada), sem o próprio
-    anúncio. Carro: só o mesmo ano (±1) — 2008 e 2016 não se comparam.
+    anúncio. Veículo (carro, ou qualquer um com "Ano:" da OLX): só o mesmo ano (±1) — 2008 e 2016 não se comparam.
     Busca de peça COM DEFEITO: só os comparáveis com defeito (comparar placa
     quebrada com funcionando faria toda quebrada parecer "golpe").
     Menos de 5 comparáveis = sem base."""
@@ -427,8 +475,9 @@ def referencia_preco(item: dict, comparaveis: list[dict]) -> tuple[float | None,
         comps = [c for c in comps if c.get("categoria") in (item["categoria"], "", None)]
     if item.get("condicao") == "defeito":
         comps = [c for c in comps if tem_defeito(c, item.get("tipo"))]
-    if item.get("tipo") == "carro":
-        ano = ano_do_anuncio(item)
+    # carro, e todo anúncio com "Ano:" da OLX (moto 2017 x 2025 não se comparam)
+    ano = ano_do_anuncio(item, so_atributo=item.get("tipo") != "carro")
+    if ano or item.get("tipo") == "carro":
         if not ano:
             return None, 0
         comps = [c for c in comps if (a := ano_do_anuncio(c)) and abs(a - ano) <= 1]
@@ -718,6 +767,10 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
 # ── FILA ──────────────────────────────────────────────────
 
 ultimo_processamento: str | None = None
+# ponytail: teto fixo por busca e passada; o 1º scan de uma busca ampla (ou um
+# bug, como o fuzz que gravou 50 buscas-lixo e mandou 170 alertas) não vira
+# enxurrada. O resto fica no /top e no resumo.
+MAX_ALERTAS = 5
 _lock = asyncio.Lock()   # web e scheduler disparavam a fila em paralelo -> notificação dupla
 
 
@@ -733,6 +786,7 @@ async def processar_fila(notifier=None):
             return
         comparaveis: dict[int, list] = {}
         por_busca: dict[int, dict] = {}
+        alertas: list[tuple[dict, dict]] = []
         modelo = Classificador(db.feedbacks())
         for i in range(0, len(itens), 200):          # lotes: não trava o event loop
             lote, salvar = itens[i:i + 200], []
@@ -741,7 +795,7 @@ async def processar_fila(notifier=None):
                 try:
                     if bid not in comparaveis:
                         comparaveis[bid] = [c for c in db.anuncios_comparaveis(bid)
-                                            if produto_bate(item.get("termo") or "", c["titulo"])[0]]
+                                            if identidade(item.get("termo") or "", c)[0]]
                     salvar.append((item, avaliar(item, comparaveis[bid], modelo)))
                 except Exception:
                     logger.exception(f"falha avaliando anúncio {item['anuncio_id']}")
@@ -751,21 +805,33 @@ async def processar_fila(notifier=None):
             for item, av in salvar:
                 if item["prioridade"] < 0:
                     continue
-                r = por_busca.setdefault(item["busca_id"], {"nome": item.get("nome", "?"),
-                                                            "n": 0, "comprar": 0, "ver": 0})
+                r = por_busca.setdefault(item["busca_id"], {
+                    "nome": item.get("nome", "?"), "n": 0, "comprar": 0, "ver": 0,
+                    "alertas": 0, "sem_alerta": 0, "cats": {}, "filtrada": bool(_lista(item.get("categorias")))})
                 r["n"] += 1
                 r["comprar"] += av["recomendacao"] == "COMPRAR"
                 r["ver"] += av["recomendacao"] == "VER"
-                # notificado: a reavaliação (descrição nova, preço mudou) não re-notifica
-                if av["alerta"] and notifier and item["ativo"] and not item["notificado"]:
-                    if await notifier.enviar_resultado(item, av):
-                        db.marcar_notificado(item["anuncio_id"])
-                        logger.info(f"alerta {av['alerta']} enviado: [{item.get('nome')}] "
-                                    f"{(item.get('titulo') or '')[:50]} R$ {item.get('preco') or 0:.0f}")
+                if av["decisao"] == "APROVADO" and item.get("categoria"):
+                    r["cats"][item["categoria"]] = r["cats"].get(item["categoria"], 0) + 1
+                # notificado: a reavaliação (preço mudou) não re-notifica. Descrição
+                # ainda não baixada: o alerta sai quando ela chegar (re-enfileira)
+                if av["alerta"] and notifier and item["ativo"] and not item["notificado"] \
+                        and item.get("descricao"):
+                    alertas.append((item, av))
                 _broadcast({"tipo": "avaliado", "anuncio_id": item["anuncio_id"],
                             "busca_id": item["busca_id"], "recomendacao": av["recomendacao"],
                             "score": av["score"]})
             await asyncio.sleep(0)
+
+        for item, av in sorted(alertas, key=lambda x: -x[1]["score"]):     # os melhores primeiro
+            r = por_busca[item["busca_id"]]
+            if r["alertas"] >= MAX_ALERTAS:
+                r["sem_alerta"] += 1
+            elif await notifier.enviar_resultado(item, av):
+                r["alertas"] += 1
+                db.marcar_notificado(item["anuncio_id"])
+                logger.info(f"alerta {av['alerta']} enviado: [{item.get('nome')}] "
+                            f"{(item.get('titulo') or '')[:50]} R$ {item.get('preco') or 0:.0f}")
 
         ultimo_processamento = datetime.now(FUSO).isoformat(timespec="seconds")
         logger.info(f"Avaliados {len(itens)} anúncios")
@@ -773,6 +839,11 @@ async def processar_fila(notifier=None):
 
         if notifier:
             for bid, r in por_busca.items():
+                recente = db.busca_recente(bid)
+                # 1º scan com resultado misturado ("civic": carros E peças): mostra
+                # as categorias e o /categorias, que resolve sem regra nova
+                if not (recente and not r["filtrada"] and len(r["cats"]) >= 2):
+                    r["cats"] = {}
                 # lote 100% ignorado só interessa no 1º scan de busca nova
-                if r["n"] >= 5 and (r["comprar"] + r["ver"] > 0 or db.busca_recente(bid)):
+                if (r["n"] >= 5 and (r["comprar"] + r["ver"] > 0 or recente)) or r["sem_alerta"]:
                     await notifier.enviar_resumo(bid, r)

@@ -127,6 +127,13 @@ def _mapear_flight_ad(ad: dict) -> dict | None:
                 if ad.get("date") else "")
     except Exception:
         data = ""
+    categoria = texto("category") or texto("categoryName")
+    # imóvel: venda e aluguel vêm na MESMA categoria ("Apartamentos"); separar
+    # deixa a mediana e o /categorias com sentido (aluguel 3 mil x venda 1 milhão)
+    for p in lista("properties"):
+        if isinstance(p, dict) and p.get("name") == "real_estate_type" and categoria \
+                and (m := re.match(r"(Venda|Aluguel) - ", str(p.get("value")))):
+            categoria += f" ({m.group(1).lower()})"
     imgs = lista("images")
     imagem = imgs[0].get("original") if imgs and isinstance(imgs[0], dict) else ""
     entrega = bool(d("olxDelivery").get("enabled") or ad.get("olxDeliveryBadgeEnabled") is True)
@@ -141,7 +148,7 @@ def _mapear_flight_ad(ad: dict) -> dict | None:
         "vendedor":       "loja" if ad.get("professionalAd") is True else "particular",
         "imagem":         imagem if isinstance(imagem, str) else "",
         "atributos":      " · ".join(atributos),
-        "categoria":      texto("category") or texto("categoryName"),
+        "categoria":      categoria,
         "olx_pay":        bool(d("olxPay").get("enabled") or ad.get("olxPayBadgeEnabled") is True),
         "descricao":      "",
     }
@@ -259,8 +266,9 @@ def _montar_url(busca: dict, pagina: int) -> str:
     if vendedor == "particular": params += "&f=p"
     elif vendedor == "loja":     params += "&f=c"
 
-    # carros/imóveis NÃO aparecem na busca genérica por texto — só na categoria
-    # (verificado: /go?q=punto = 0 anúncios; categoria carros = 50)
+    # a busca geral (/brasil?q=) alcança TODAS as categorias, carros e imóveis
+    # inclusive (verificado 2026-10-23); a URL da categoria serve p/ os filtros
+    # dela (ano rs/re) e p/ "carro sem modelo" = categoria inteira
     tipo = busca.get("tipo", "produto")
     extras = busca.get("filtros_extra") or {}
     if isinstance(extras, str):

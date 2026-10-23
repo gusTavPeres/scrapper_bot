@@ -14,7 +14,12 @@ navegador) e avisa no Telegram quando aparece uma oportunidade.
   e um classificador que aprende com os 👍/👎 dos alertas.
 - **Alertas:** 🟢 COMPRAR (produto certo, sem problema, preço bom), 🟡 VALE
   NEGOCIAR (o preço compensa uma ressalva, ou o vendedor aceita proposta um pouco
-  acima do teto) e 💸 queda de preço / entrou no teto.
+  acima do teto) e 💸 queda de preço / entrou no teto. Só depois de ler a
+  descrição, e no máximo 5 por busca a cada rodada (o resto fica no `/top`).
+- **Qualquer categoria e estado:** a busca da OLX alcança tudo (eletrônicos,
+  carros, motos, imóveis, barcos...). Termo amplo mistura categorias ("civic" traz
+  carros e peças): o resumo do 1º scan lista as categorias e o `/categorias`
+  filtra. Veículos comparam preço com o mesmo ano; imóveis separam venda e aluguel.
 
 ## Instalar
 
@@ -64,6 +69,6 @@ para aceitar só conexões da própria máquina). Segredos ficam só no `.env`
 ## Testes
 
 ```bash
-./venv/bin/python test_offline.py      # 64 testes de regressão (não usam rede nem o banco real)
+./venv/bin/python test_offline.py      # 66 testes de regressão (não usam rede nem o banco real)
 ./venv/bin/python test_live_olx.py     # canário contra a OLX real (layout, RSC, ordem)
 ```

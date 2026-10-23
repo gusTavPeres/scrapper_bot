@@ -44,8 +44,11 @@ async def main():
         print(f"OK busca: {len(ads)} anúncios por data, ex.: {a['titulo'][:40]} R$ {a['preco']:.0f}")
 
         ads2, _ = await pagina({"termo": "geladeira"}, 2)
-        assert ads2 and not {x["list_id"] for x in ads2} & {x["list_id"] for x in ads}, "pág 2 = pág 1"
-        print(f"OK paginação: pág 2 com {len(ads2)} anúncios diferentes")
+        # por data, anúncio novo entre as 2 requisições empurra 1-2 da pág 1 p/ a 2
+        # (o raspador descarta repetidos); paginação quebrada repete ~todos
+        repetidos = {x["list_id"] for x in ads2} & {x["list_id"] for x in ads}
+        assert ads2 and len(repetidos) < 10, f"pág 2 repete {len(repetidos)} da pág 1"
+        print(f"OK paginação: pág 2 com {len(ads2)} anúncios ({len(repetidos)} empurrados da pág 1)")
 
         ads, _ = await pagina({"termo": "geladeira", "estado": "go"})
         assert ads and len(ads) >= 20, f"busca por estado devolveu {ads and len(ads)}"
