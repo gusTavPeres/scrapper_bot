@@ -1,0 +1,21 @@
+# modelo: o `setup.sh --servico` troca __DIR__ e instala em /etc/systemd/system/
+[Unit]
+Description=Monitor OLX Web
+# network-online: no boot a rede ainda não existia e todas as buscas iam p/ erro
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=__DIR__
+EnvironmentFile=__DIR__/.env
+ExecStart=__DIR__/venv/bin/python __DIR__/main.py
+Restart=on-failure
+RestartSec=10
+UMask=0077
+StandardOutput=append:__DIR__/logs/bot.log
+StandardError=append:__DIR__/logs/bot.log
+
+[Install]
+WantedBy=multi-user.target

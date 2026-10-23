@@ -1,0 +1,10 @@
+# runtime
+fastapi==0.136.1
+uvicorn==0.47.0        # sem [standard]: uvloop/httptools/yaml não fazem diferença aqui (-25 MB)
+websockets==16.0       # WebSocket do painel
+pydantic==2.13.4
+requests==2.34.2
+curl_cffi==0.16.3      # HTTP com TLS de Chrome: a OLX (Cloudflare) dá 403 p/ requests puro
+tzdata==2026.5         # fuso America/Sao_Paulo também no Windows (zoneinfo)
+# testes (test_offline.py usa o TestClient)
+httpx==0.28.1

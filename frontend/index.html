@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<link rel="icon" href="data:,">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Monitor OLX</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- HEADER -->
+<header class="header">
+  <div class="header-brand">
+    <div class="header-logo">◈</div>
+    <span class="header-title">Monitor OLX</span>
+  </div>
+  <div class="header-status">
+    <div class="status-pill fila-pill">
+      <span>fila:</span>
+      <span id="fila-count" class="mono">0</span>
+    </div>
+    <button class="btn-primary" id="btn-nova-busca">+ Nova busca</button>
+  </div>
+</header>
+
+<!-- LAYOUT PRINCIPAL -->
+<div class="layout">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <span class="sidebar-label">BUSCAS</span>
+    </div>
+    <div id="lista-buscas" class="lista-buscas">
+      <div class="empty-state">Nenhuma busca criada.</div>
+    </div>
+  </aside>
+
+  <!-- ÁREA PRINCIPAL -->
+  <main class="main-area" id="main-area">
+    <div class="welcome-screen" id="welcome">
+      <div class="welcome-icon">◈</div>
+      <h2>Monitor de Anúncios</h2>
+      <p>Crie uma busca para começar a monitorar.</p>
+      <button class="btn-primary large" onclick="abrirModalNovaBusca()">+ Nova busca</button>
+    </div>
+  </main>
+
+</div>
+
+<!-- ═══ MODAL: NOVA / EDITAR BUSCA ═══════════════════════ -->
+<div class="modal-overlay hidden" id="modal-busca">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="modal-busca-titulo">Nova Busca</h3>
+      <button class="btn-close" onclick="fecharModal('modal-busca')">✕</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="busca-id-edit">
+      <div class="form-grid">
+        <div class="form-group full">
+          <label>Nome da busca</label>
+          <input type="text" id="f-nome" placeholder="Ex: RTX 3090 com defeito">
+        </div>
+        <div class="form-group">
+          <label>Tipo</label>
+          <select id="f-tipo">
+            <option value="produto">Produto</option>
+            <option value="carro">Carro</option>
+            <option value="imovel">Imóvel</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Termo de busca</label>
+          <input type="text" id="f-termo" placeholder="Ex: placa de video 3090">
+        </div>
+        <div class="form-group">
+          <label>Estado</label>
+          <input type="text" id="f-estado" placeholder="brasil" value="brasil">
+        </div>
+        <div class="form-group">
+          <label>Intervalo (minutos)</label>
+          <input type="number" id="f-intervalo" value="30" min="5" max="1440">
+        </div>
+        <div class="form-group">
+          <label>Preço mín (R$)</label>
+          <input type="number" id="f-preco-min" value="0" min="0">
+        </div>
+        <div class="form-group">
+          <label>Preço máx (R$)</label>
+          <input type="number" id="f-preco-max" value="0" min="0">
+        </div>
+        <div class="form-group">
+          <label>Filtro de envio</label>
+          <select id="f-envio">
+            <option value="qualquer">Qualquer</option>
+            <option value="com_envio">Com envio</option>
+            <option value="sem_envio">Sem envio</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Condição procurada</label>
+          <select id="f-condicao">
+            <option value="funcionando">Funcionando (defeito penaliza)</option>
+            <option value="defeito">Com defeito / para peças</option>
+            <option value="qualquer">Qualquer (só informa)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Vendedor</label>
+          <select id="f-vendedor">
+            <option value="qualquer">Qualquer</option>
+            <option value="particular">Só particular</option>
+            <option value="loja">Só loja</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Garantia OLX</label>
+          <select id="f-garantia">
+            <option value="">Sem filtro</option>
+            <option value="pay">Garantia da OLX</option>
+            <option value="pay_entrega">Garantia + Entrega</option>
+          </select>
+        </div>
+        <div class="form-group full">
+          <label>Incluir se possível <span class="hint">(um por linha)</span></label>
+          <textarea id="f-inclusao" rows="3" placeholder="com defeito&#10;para reparo&#10;não funciona"></textarea>
+        </div>
+        <div class="form-group full">
+          <label>Excluir se presente <span class="hint">(um por linha)</span></label>
+          <textarea id="f-exclusao" rows="3" placeholder="novo&#10;lacrado&#10;capa de"></textarea>
+        </div>
+        <div class="form-group full" id="grupo-categorias" hidden>
+          <label>Categorias da OLX <span class="hint">(nenhuma marcada = todas; os números são anúncios ativos)</span></label>
+          <div id="f-categorias" class="lista-categorias"></div>
+        </div>
+        <div class="form-group full">
+          <label>Regras em texto livre <span class="hint">("sem X"/"nada de X" exclui · "só com X" exige · "prefiro X" pontua)</span></label>
+          <textarea id="f-obs" rows="2" placeholder="Ex: só com nota fiscal, nada de leilão nem batido, prefiro câmbio manual"></textarea>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="fecharModal('modal-busca')">Cancelar</button>
+      <button class="btn-primary" onclick="salvarBusca()">Salvar</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ MODAL: DETALHE DO ANÚNCIO ════════════════════════ -->
+<div class="modal-overlay hidden" id="modal-detalhe">
+  <div class="modal modal-lg">
+    <div class="modal-header">
+      <h3 id="detalhe-titulo">Detalhes</h3>
+      <button class="btn-close" onclick="fecharModal('modal-detalhe')">✕</button>
+    </div>
+    <div class="modal-body" id="detalhe-body"></div>
+  </div>
+</div>
+
+<!-- TOAST -->
+<div id="toast" class="toast hidden"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
