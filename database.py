@@ -13,6 +13,8 @@ interrupção no meio deixava a busca fora de buscas_para_processar PARA SEMPRE.
 """
 import hashlib
 import json
+import logging
+import os
 import random
 import re
 import sqlite3
@@ -20,6 +22,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).parent / "data" / "bot.db"
 VERSAO_SCHEMA = 1
@@ -203,18 +207,24 @@ def manutencao_diaria():
     if bak.exists() and time.time() - bak.stat().st_mtime < 86400:
         return
     with get_conn() as conn:
-        conn.execute("""
+        apagados = conn.execute("""
             DELETE FROM anuncios WHERE id NOT IN (SELECT anuncio_id FROM feedback
                                                   WHERE anuncio_id IS NOT NULL)
               AND (ultima_vez < datetime('now','-180 days')
                    OR (ultima_vez < datetime('now','-30 days')
                        AND id IN (SELECT anuncio_id FROM analises WHERE recomendacao='IGNORAR')))
-        """)
+        """).rowcount
     tmp = DB_PATH.with_suffix(".db.tmp")
     tmp.unlink(missing_ok=True)
     with get_conn() as conn:
         conn.execute("VACUUM INTO ?", (str(tmp),))
     tmp.replace(bak)
+    try:     # RAM 1x/dia no log: tendência de vazamento visível sem ferramenta (só Linux)
+        ram = f"; RAM {int(open('/proc/self/statm').read().split()[1]) * os.sysconf('SC_PAGE_SIZE') >> 20} MB"
+    except (OSError, ValueError, AttributeError):
+        ram = ""
+    logger.info(f"faxina diária: {apagados} anúncios velhos apagados; backup {bak.name} "
+                f"({bak.stat().st_size // 1024} KB){ram}")
 
 
 def _proximo(intervalo_min: int) -> str:

@@ -410,7 +410,15 @@ def test_p2_manutencao_diaria():
         sql(f"UPDATE anuncios SET ultima_vez=datetime('now','-{dias} days') WHERE id=?", aid)
         ids[nome] = aid
     db.registrar_feedback(ids["curtido"], True)
-    db.manutencao_diaria()
+    linhas = []
+    h = logging.Handler(); h.emit = lambda r: linhas.append(r.getMessage())
+    lg = logging.getLogger("database")
+    lg.addHandler(h); lg.setLevel(logging.INFO)
+    try:
+        db.manutencao_diaria()
+    finally:
+        lg.removeHandler(h); lg.setLevel(logging.NOTSET)
+    assert any("faxina diária: 2 anúncios velhos apagados" in x for x in linhas), linhas   # aparece no log
     restam = {n for n, i in ids.items() if sql("SELECT 1 FROM anuncios WHERE id=?", i)}
     assert restam == {"lixo_novo", "bom_velho", "curtido"}, restam
     bak = db.DB_PATH.with_suffix(".db.bak")
@@ -1877,6 +1885,12 @@ def test_p9_alertas_contidos():
     n2 = NotifierFalso()
     rodar(avaliador.processar_fila(n2))
     assert n2.resumos and all(not r["cats"] for r in n2.resumos), n2.resumos
+
+
+def test_p9_list_e_apelido_de_buscas():
+    novo_banco()
+    criar()
+    assert tb.tratar_comando("/list") == tb.tratar_comando("/buscas") != "Comando desconhecido — /help"
 
 
 def test_p9_regra_nova_reavalia_o_banco():

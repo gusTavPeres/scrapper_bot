@@ -177,7 +177,7 @@ def tratar_comando(texto: str) -> str:
                 f"buscas: {por['ativa']} ativas · {por['pausada']} pausadas · {por['erro']} com erro\n"
                 + status_classificador())
 
-    if cmd == "buscas":
+    if cmd in ("buscas", "list", "lista", "listar"):
         buscas = db.listar_buscas()
         if not buscas:
             return "Nenhuma busca criada. Use /add &lt;termo&gt;."
