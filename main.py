@@ -112,7 +112,7 @@ async def _watchdog():
     O heartbeat é por busca (cada uma tem teto de 15 min)."""
     while True:
         await asyncio.sleep(60)
-        parado = time.time() - scheduler.ultimo_ciclo
+        parado = time.monotonic() - scheduler.ultimo_ciclo    # relógio do PC mudar não conta
         if parado > 2700:
             logger.critical(f"WATCHDOG: scheduler sem ciclo há {parado:.0f}s — reiniciando o processo")
             os._exit(1)   # Restart=on-failure do systemd assume daqui
@@ -295,5 +295,9 @@ async def index(_=Depends(verificar_auth)):
 
 if __name__ == "__main__":     # ponto de entrada único: run.sh, systemd e Docker
     import uvicorn
+    # WebSocket: a implementação antiga (websockets "legacy") com compressão
+    # permessage-deflate prendia ~76 KB de memória nativa por conexão do painel
+    # (medido: 1.500 conexões = +112 MB); sansio sem compressão:
+    # 0,7 KB. As mensagens são JSON de ~100 bytes: compressão não paga nada.
     uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8080")),
-                access_log=False)
+                access_log=False, ws="websockets-sansio", ws_per_message_deflate=False)

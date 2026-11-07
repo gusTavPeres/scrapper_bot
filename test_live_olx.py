@@ -1,7 +1,7 @@
 """Canário contra a OLX REAL: pega mudança de layout/bloqueio que teste
 sintético não vê (o flight data morreu em runtime e o bot passou meses
 raspando ~5 de 50 anúncios por página sem ninguém notar).
-Uso: ./venv/bin/python test_live_olx.py   (~20 s, ~8 requisições)"""
+Uso: ./venv/bin/python test_live_olx.py   (~30 s, ~13 requisições)"""
 import asyncio
 import re
 import tempfile
@@ -64,6 +64,13 @@ async def main():
         desc = s.extrair_descricao((await s._baixar(sessao, ads[0]["url"])).text)
         assert len(desc) > 10, "descrição vazia — JSON-LD do anúncio mudou?"
         print(f"OK descrição: {desc[:60]!r}")
+
+    # mediana do mercado: a busca SEM o teto, como o bot mede 1x/dia
+    bid = database.criar_busca({"nome": "canário mercado", "termo": "rtx 3090", "preco_max": 6000})
+    await s._atualizar_mercado(database.obter_busca(bid))
+    m = database.obter_busca(bid)["mercado"]
+    assert m.get("mediana") and m["n"] >= 10 and m["mediana"] > 3000, f"mercado da 3090: {m}"
+    print(f"OK mercado sem teto: mediana R$ {m['mediana']} de {m['n']} anúncios")
 
     busca = {"id": 0, "nome": "canário", "termo": "rtx 4090"}
     r = await s.raspar_busca(busca, "monitor")

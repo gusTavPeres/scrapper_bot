@@ -43,7 +43,7 @@ def _brl(v) -> str:
 
 
 def _post(metodo: str, dados: dict, timeout: int) -> bool:
-    """`dados` pode trazer chat_id próprio (resposta a quem ainda não é o dono)."""
+    """`dados` pode trazer chat_id próprio (resposta a quem ainda não está no .env)."""
     if not TOKEN or not (CHAT_ID or dados.get("chat_id")):
         logger.warning("Telegram não configurado.")
         return False
@@ -111,10 +111,11 @@ async def enviar_resultado(anuncio: dict, avaliacao: dict) -> bool:
     """True só se o Telegram aceitou — o chamador marca 'notificado' com isso."""
     rec  = avaliacao.get("recomendacao", "VER")
     pct  = avaliacao.get("preco_vs_mercado_pct")
-    ref  = "seu teto" if anuncio.get("preco_max") else "mercado"
+    ref  = "seu teto" if avaliacao.get("referencia") == "teto" else "mercado"
     pct_txt = f" ({pct:+d}% vs {ref})" if pct is not None else ""
-    cabecalho = ("🟡 <b>VALE NEGOCIAR</b> — o preço compensa as ressalvas"
-                 if avaliacao.get("alerta") == "negociar" else f"{_REC_EMOJI.get(rec, '⚪')} <b>{rec}</b>")
+    cabecalho = {"negociar": "🟡 <b>VALE NEGOCIAR</b> — o preço compensa as ressalvas",
+                 "suspeita": "⚠️ <b>PECHINCHA SUSPEITA</b> — barato demais, com sinal de golpe: confira antes",
+                 }.get(avaliacao.get("alerta"), f"{_REC_EMOJI.get(rec, '⚪')} <b>{rec}</b>")
     linhas = [
         f"{cabecalho} — Score {avaliacao.get('score', 0)}/10",
         f"🔎 <b>{esc(anuncio.get('nome') or anuncio.get('termo'))}</b>",
@@ -166,9 +167,10 @@ _ultimo_alerta: dict[str, float] = {}
 
 
 def alertar(chave: str, texto: str, horas: float = 12) -> bool:
-    """Alerta operacional com debounce por chave (bloqueio da OLX etc.)."""
-    agora = time.time()
-    if agora - _ultimo_alerta.get(chave, 0) < horas * 3600:
+    """Alerta operacional com debounce por chave (bloqueio da OLX etc.).
+    Relógio monotônico: o do PC voltando no tempo não silencia o aviso."""
+    agora = time.monotonic()
+    if chave in _ultimo_alerta and agora - _ultimo_alerta[chave] < horas * 3600:
         return False
     ok = _enviar(texto)
     # falhou (Telegram/rede fora): tenta de novo em 30 min, não só daqui a `horas`

@@ -6,16 +6,26 @@ navegador) e avisa no Telegram quando aparece uma oportunidade.
 - **Raspagem:** HTTP com TLS de Chrome (`curl_cffi`) lendo o payload RSC do
   Next.js da OLX (~3x menor que o HTML; o HTML é a reserva). Cada busca roda
   sem parar: a cada intervalo lê só as novidades (por data) e 1x/dia relê tudo
-  (é assim que detecta anúncio expirado). ~0,1 s de CPU e ~60 MB de RAM por ciclo.
+  (é assim que detecta anúncio expirado). ~0,1 s de CPU e ~75 MB de RAM; se a
+  RAM subir 5 MB, o log anota ("RAM subiu") p/ achar o evento que causou; acima
+  de 200 MB o processo se reinicia sozinho (systemd/compose sobem de novo).
 - **Avaliação** (`avaliador.py`): identidade do produto (modelo, sufixo Ti/Super,
   PC montado, acessório, lista de modelos, troca), regras do usuário
   ("sem X", "só com X", "prefiro X"), problemas por gravidade (leve / moderado /
   grave), golpe, preço vs. o teto do usuário ou a mediana de anúncios comparáveis,
-  e um classificador que aprende com os 👍/👎 dos alertas.
+  e um classificador que aprende com os 👍/👎 dos alertas. Busca com teto: 1x/dia
+  o bot lê a busca SEM o teto e guarda a mediana do mercado (por memória: 8 GB e
+  16 GB são mercados diferentes); dentro do teto só é 🟢 o que está 20%+ abaixo
+  dela (pechincha), e metade do mercado é tratado como suspeito.
 - **Alertas:** 🟢 COMPRAR (produto certo, sem problema, preço bom), 🟡 VALE
   NEGOCIAR (o preço compensa uma ressalva, ou o vendedor aceita proposta um pouco
-  acima do teto) e 💸 queda de preço / entrou no teto. Só depois de ler a
+  acima do teto), ⚠️ PECHINCHA SUSPEITA (40%+ abaixo do mercado com contato fora
+  da OLX, pressa ou descrição curta, ou metade do mercado: padrão comum de golpe)
+  e 💸 queda de preço /
+  entrou no teto. Só depois de ler a
   descrição, e no máximo 5 por busca a cada rodada (o resto fica no `/top`).
+  Anúncio republicado pelo vendedor não repete o alerta; anúncio só de troca
+  não alerta. Bloqueio da OLX só vira aviso depois de 1 h sem conseguir ler.
 - **Qualquer categoria e estado:** a busca da OLX alcança tudo (eletrônicos,
   carros, motos, imóveis, barcos...). Termo amplo mistura categorias ("civic" traz
   carros e peças): o resumo do 1º scan lista as categorias e o `/categorias`
@@ -55,7 +65,7 @@ responde com o seu chat id. Coloque-o no `.env` e reinicie.
 ## Usar
 
 Telegram: `/add rtx 5060 max=1.900`, `/add rtx 3090 com defeito`,
-`/addcarro linea ano=2011-2016 estado=go`, `/buscas`, `/top`, `/categorias <id>`,
+`/addcarro linea ano=2011-2016 estado=sp`, `/buscas`, `/top`, `/categorias <id>`,
 `/scan <id>`, `/pausar <id>`, `/del <id> sim`, `/help`.
 O painel web faz o mesmo e mostra o detalhe de cada avaliação.
 
@@ -69,6 +79,6 @@ para aceitar só conexões da própria máquina). Segredos ficam só no `.env`
 ## Testes
 
 ```bash
-./venv/bin/python test_offline.py      # 68 testes de regressão (não usam rede nem o banco real)
+./venv/bin/python test_offline.py      # 77 testes de regressão (não usam rede nem o banco real)
 ./venv/bin/python test_live_olx.py     # canário contra a OLX real (layout, RSC, ordem)
 ```

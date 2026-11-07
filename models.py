@@ -55,7 +55,9 @@ class Avaliacao(BaseModel):
     motivo:              str
     # o que vira alerta no Telegram: "comprar" (🟢) ou "negociar" (🟡: o preço
     # compensa uma ressalva); "" não notifica
-    alerta:              Literal["", "comprar", "negociar"] = ""
+    alerta:              Literal["", "comprar", "negociar", "suspeita"] = ""
+    # contra o quê o preco_vs_mercado_pct foi medido (rótulo do alerta; não vai p/ o banco)
+    referencia:          Literal["", "teto", "mercado"] = ""
 
     @model_validator(mode="after")
     def coerencia_recomendacao(self):

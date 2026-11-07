@@ -15,12 +15,17 @@ Sem flight data = falha explícita (OlxIndisponivel), nunca raspar às cegas:
 o fallback CSS antigo escondeu por meses que só ~5 de 50 anúncios entravam.
 """
 import asyncio
+import ctypes
+import gc
 import html
 import json
 import logging
+import os
 import re
+import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import quote
 
 from curl_cffi.requests import AsyncSession
@@ -247,7 +252,7 @@ def _sessao():
 
 # ── URL E FILTROS ─────────────────────────────────────────
 
-def _montar_url(busca: dict, pagina: int) -> str:
+def _montar_url(busca: dict, pagina: int, teto: bool = True) -> str:
     estado   = busca.get("estado") or "brasil"
     termo    = quote(avaliador.termo_de_busca(busca.get("termo") or ""))
     preco_min = busca.get("preco_min") or 0
@@ -261,13 +266,14 @@ def _montar_url(busca: dict, pagina: int) -> str:
     params = "&sf=1"
     if preco_min > 0: params += f"&ps={int(preco_min)}"
     # até 15% acima do teto: quem aceita proposta ainda pode caber no seu preço
-    if preco_max > 0: params += f"&pe={round(preco_max * (1 + avaliador.MARGEM_NEGOCIACAO))}"
+    if preco_max > 0 and teto:          # sem teto: medição do mercado (_atualizar_mercado)
+        params += f"&pe={round(preco_max * (1 + avaliador.MARGEM_NEGOCIACAO))}"
     # semântica REAL da OLX (verificada): f=p -> particular, f=c -> loja/comercial
     if vendedor == "particular": params += "&f=p"
     elif vendedor == "loja":     params += "&f=c"
 
     # a busca geral (/brasil?q=) alcança TODAS as categorias, carros e imóveis
-    # inclusive (verificado 2026-10-23); a URL da categoria serve p/ os filtros
+    # inclusive; a URL da categoria serve p/ os filtros
     # dela (ano rs/re) e p/ "carro sem modelo" = categoria inteira
     tipo = busca.get("tipo", "produto")
     extras = busca.get("filtros_extra") or {}
@@ -286,7 +292,7 @@ def _montar_url(busca: dict, pagina: int) -> str:
     elif tipo == "imovel":
         base = f"https://www.olx.com.br/imoveis{uf}"
     else:
-        # /go?q= devolve 0 resultados + 80 recomendações (verificado 2026-10-22)
+        # /go?q= devolve 0 resultados + 80 recomendações
         base = f"https://www.olx.com.br{uf or '/brasil'}"
     q = f"q={termo}&" if termo else ""     # carro sem modelo = categoria inteira
     return f"{base}?{q}o={pagina}{params}"
@@ -426,16 +432,127 @@ async def _preencher_descricoes(busca: dict, limite: int = 60):
         logger.info(f"[{busca.get('nome')}] {ok} descrições preenchidas")
 
 
+async def _atualizar_mercado(busca: dict):
+    """Mediana do MERCADO: a busca SEM o teto, até 5 páginas (as mais novas),
+    só o produto certo e sem defeito; 1x/dia. Com teto, a OLX só devolve até
+    teto+15% e a nota não sabe se o preço é pechincha ou só o normal. Amostra
+    pequena/dispersa também fica registrada (senão remediria a cada rodada);
+    falha não derruba a busca: tenta de novo na próxima."""
+    nome = busca.get("nome")
+    try:
+        precos, vistos = [], set()
+        async with _sessao() as sessao:
+            for pagina in range(1, 6):
+                ads = await _pagina_de_busca(sessao, _montar_url(busca, pagina, teto=False))
+                novos = [a for a in ads or [] if (a["list_id"] or a["url"]) not in vistos]
+                if not novos:
+                    break
+                vistos.update(a["list_id"] or a["url"] for a in novos)
+                precos += [(a["preco"], avaliador.variante(a["titulo"], a["atributos"])) for a in novos
+                           if a["preco"] > 0 and avaliador.triagem(busca, a)[0]
+                           and not avaliador.tem_defeito(a, busca.get("tipo"))]
+                await asyncio.sleep(1.5)
+        resumo = avaliador.resumo_mercado(precos)
+        db.salvar_mercado(busca["id"], resumo or {"n": len(precos)})
+        logger.info(f"[{nome}] mercado: " + (
+            f"mediana {avaliador._brl(resumo['mediana'])} de {resumo['n']} anúncios" + "".join(
+                f"; {v}: {avaliador._brl(g['mediana'])} ({g['n']})" for v, g in resumo["variantes"].items())
+            if resumo else f"amostra pequena ou dispersa demais ({len(precos)} anúncios), sem referência"))
+    except Exception as e:
+        logger.warning(f"[{nome}] medição de mercado falhou: {e}")
+
+
 # ── LOOP PRINCIPAL ────────────────────────────────────────
 
-ultimo_ciclo = time.time()   # heartbeat lido pelo watchdog do main.py
+ultimo_ciclo = time.monotonic()   # heartbeat lido pelo watchdog do main.py
+
+# Bloqueio da OLX só vira alerta quando as falhas seguem por 1 h sem nenhuma
+# leitura boa no meio: o Cloudflare às vezes dá 403 em ondas de ~30 min e o bot
+# se recupera sozinho; avisar já na 1ª falha seria alarme falso. Conta da 1ª
+# falha, não do último sucesso:
+# busca diária com um 403 isolado não pode alarmar.
+OLX_ALERTA_APOS = 3600
+_olx_falha_desde = None           # 1ª falha da sequência atual (relógio monotônico)
+_olx_alertado = False
+# 403/429: TODAS as buscas esperam 15 min, senão cada uma bate sozinha no
+# bloqueio. Insistir no bloqueio só piora o histórico do IP.
+OLX_PAUSA = 900
+_olx_pausa_ate = 0.0
+
+
+async def _olx_respondeu():
+    global _olx_falha_desde, _olx_alertado
+    _olx_falha_desde = None
+    if _olx_alertado:
+        _olx_alertado = False
+        await asyncio.to_thread(notifier.alertar, "olx_voltou",
+                                "✅ <b>OLX voltou</b>: o bot está lendo os anúncios de novo.", 0)
+
+
+async def _olx_falhou(e: Exception):
+    global _olx_falha_desde, _olx_alertado
+    agora = time.monotonic()
+    if _olx_falha_desde is None:
+        _olx_falha_desde = agora
+    parado = agora - _olx_falha_desde
+    if parado >= OLX_ALERTA_APOS and not _olx_alertado:
+        _olx_alertado = await asyncio.to_thread(
+            notifier.alertar, "olx",
+            f"⚠️ <b>OLX indisponível</b> há {parado / 60:.0f} min: {notifier.esc(str(e))}\n"
+            "Bloqueio ou mudança de layout. O bot continua tentando e avisa quando voltar.", 0)
+
+
+try:   # glibc: devolve ao sistema a memória livre presa no heap fragmentado
+    _malloc_trim = ctypes.CDLL("libc.so.6").malloc_trim
+except (OSError, AttributeError):          # macOS, Windows, musl: não tem
+    _malloc_trim = None
+_ram_base = 0
+RAM_MAX = 200          # MB; o normal é ~76
+
+
+def _vigiar_ram():
+    """Depois de cada rodada com busca: gc.collect + malloc_trim (devolve ao
+    sistema o que foi liberado) e 1 linha no log quando a RAM fica 5+ MB acima
+    da última anotação, com o detalhe que mostra onde ela está."""
+    global _ram_base
+    gc.collect()          # ciclos de exceção (ver telegram_bot) antes: lixo vivo o trim não solta
+    if _malloc_trim:
+        _malloc_trim(0)
+    ram = db.ram_mb()
+    if not ram:
+        return
+    if ram > RAM_MAX:
+        # ponytail: rede de segurança p/ vazamento futuro; a linha "RAM subiu" mostra
+        # o evento. Aqui (fim da rodada) nada está em voo: sem envio ao Telegram nem
+        # escrita no banco pela metade
+        logger.critical(f"RAM em {ram} MB (limite {RAM_MAX}{_detalhe_ram()}): reiniciando o processo")
+        os._exit(1)        # Restart=on-failure (systemd) / restart: unless-stopped (compose)
+    if _ram_base and ram >= _ram_base + 5:
+        logger.info(f"RAM subiu: {ram} MB (+{ram - _ram_base} MB desde a última anotação{_detalhe_ram()})")
+    if not _ram_base or ram >= _ram_base + 5 or ram < _ram_base:
+        _ram_base = ram
+
+
+def _detalhe_ram() -> str:
+    """Onde está a memória: anônima x páginas de arquivo (bibliotecas) e objetos
+    Python vivos — separa vazamento em Python, nativo e fragmentação."""
+    try:
+        st = {k: int(v.split()[0]) >> 10 for k, v in (l.split(":", 1) for l in
+              Path("/proc/self/status").read_text().splitlines() if l.startswith("Rss"))}
+        return (f"; anônima {st['RssAnon']} MB, arquivos {st['RssFile']} MB, "
+                f"{sys.getallocatedblocks() // 1000} mil objetos Python")
+    except (OSError, KeyError, ValueError):
+        return ""
 
 
 async def ciclo(timeout_busca: float = 900):
     """Uma volta: buscas vencidas, depois a fila de avaliação."""
     global ultimo_ciclo
-    for busca in db.buscas_para_processar():
-        ultimo_ciclo = time.time()           # heartbeat por busca, não por ciclo
+    buscas = db.buscas_para_processar() if time.monotonic() >= _olx_pausa_ate else []
+    for busca in buscas:
+        if time.monotonic() < _olx_pausa_ate:      # a anterior levou 403 agora
+            break
+        ultimo_ciclo = time.monotonic()           # heartbeat por busca, não por ciclo
         try:
             # 15 min por busca: uma travada não congela o resto p/ sempre
             await asyncio.wait_for(processar_busca(busca), timeout_busca)
@@ -447,6 +564,8 @@ async def ciclo(timeout_busca: float = 900):
             db.registrar_erro(busca["id"], busca["intervalo_min"])
     await avaliador.processar_fila(notifier)
     db.manutencao_diaria()
+    if buscas:
+        _vigiar_ram()
 
 
 async def loop_scheduler():
@@ -454,7 +573,7 @@ async def loop_scheduler():
     global ultimo_ciclo
     logger.info("Scheduler iniciado.")
     while True:
-        ultimo_ciclo = time.time()
+        ultimo_ciclo = time.monotonic()
         try:
             await ciclo()
         except Exception:
@@ -466,6 +585,7 @@ async def processar_busca(busca: dict):
     """Raspa, grava, faz a triagem de identidade e baixa descrições. O STATUS
     não é tocado no início: uma interrupção no meio (timeout, reinício,
     desligamento) deixa a busca exatamente como estava, ainda processável."""
+    global _olx_pausa_ate
     bid, nome = busca["id"], busca.get("nome", str(busca["id"]))
     fase = busca.get("fase") or "scan"
     # full re-scan diário: renova ultima_vez de TODOS os anúncios (detecção de
@@ -478,6 +598,7 @@ async def processar_busca(busca: dict):
 
     try:
         produtos = await raspar_busca(busca, fase)
+        await _olx_respondeu()
         brutos = len(produtos)
         produtos = filtrar_produtos(busca, produtos)
         logger.info(f"[{nome}] {len(produtos)} anúncios coletados"
@@ -522,15 +643,17 @@ async def processar_busca(busca: dict):
         db.concluir_scan(bid, busca["intervalo_min"], scan_completo=fase == "scan" and bool(produtos))
         _broadcast({"tipo": "busca_concluida", "busca_id": bid, "fase": fase,
                     "novos": novos, "total": len(produtos)})
+        if db.mercado_vencido(bid):
+            await _atualizar_mercado(busca)
 
     except Exception as e:
         logger.error(f"[{nome}] Erro no scraping: {e}")
         db.registrar_erro(bid, busca["intervalo_min"])
         if isinstance(e, OlxIndisponivel):
-            await asyncio.to_thread(
-                notifier.alertar, "olx",
-                f"⚠️ <b>OLX indisponível</b> para o bot: {notifier.esc(str(e))}\n"
-                "Bloqueio ou mudança de layout — as buscas estão paradas.")
+            await _olx_falhou(e)
+            if re.match(r"(403|429) ", str(e)):      # bloqueio (layout mudado não pausa)
+                _olx_pausa_ate = time.monotonic() + OLX_PAUSA
+                logger.info(f"bloqueio da OLX: buscas pausadas por {OLX_PAUSA // 60} min")
         elif db.sem_sucesso_ha(bid, 6):       # rede/servidor falhando há horas: não ficar mudo
             await asyncio.to_thread(
                 notifier.alertar, f"falha:{bid}",

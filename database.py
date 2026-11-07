@@ -66,6 +66,7 @@ def init_db():
             filtros_extra   TEXT DEFAULT '{}',
             condicao        TEXT DEFAULT 'funcionando',  -- funcionando | defeito | qualquer
             categorias      TEXT DEFAULT '[]',           -- filtro opcional (categorias da OLX)
+            mercado         TEXT DEFAULT '',             -- mediana sem o teto (JSON, 1x/dia)
             intervalo_min   INTEGER DEFAULT 30,
             status          TEXT DEFAULT 'ativa',
             fase            TEXT DEFAULT 'scan',
@@ -123,6 +124,8 @@ def init_db():
         """)
         if "alerta" not in {r[1] for r in conn.execute("PRAGMA table_info(analises)")}:
             conn.execute("ALTER TABLE analises ADD COLUMN alerta TEXT DEFAULT ''")
+        if "mercado" not in {r[1] for r in conn.execute("PRAGMA table_info(buscas)")}:
+            conn.execute("ALTER TABLE buscas ADD COLUMN mercado TEXT DEFAULT ''")
         versao = conn.execute("PRAGMA user_version").fetchone()[0]
         if versao < 1:
             _migrar_v1(conn)
@@ -160,7 +163,7 @@ def init_db():
 
 
 def _migrar_v1(conn):
-    """Banco da era LLM/Xianyu -> avaliador por regras (2026-10-22)."""
+    """Banco da era LLM/Xianyu -> avaliador por regras."""
     tabelas = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     cols = {r[1] for r in conn.execute("PRAGMA table_info(buscas)")}
     if "llm_fila" in tabelas:
@@ -204,7 +207,7 @@ def manutencao_diaria():
     visto há 180 saem — antes o banco só crescia (8,8 mil anúncios, 97% lixo).
     Anúncio com 👍/👎 fica: o classificador guarda cópia, mas o painel mostra."""
     bak = DB_PATH.with_suffix(".db.bak")
-    if bak.exists() and time.time() - bak.stat().st_mtime < 86400:
+    if bak.exists() and 0 <= time.time() - bak.stat().st_mtime < 86400:   # futuro = relógio voltou
         return
     with get_conn() as conn:
         apagados = conn.execute("""
@@ -219,12 +222,17 @@ def manutencao_diaria():
     with get_conn() as conn:
         conn.execute("VACUUM INTO ?", (str(tmp),))
     tmp.replace(bak)
-    try:     # RAM 1x/dia no log: tendência de vazamento visível sem ferramenta (só Linux)
-        ram = f"; RAM {int(open('/proc/self/statm').read().split()[1]) * os.sysconf('SC_PAGE_SIZE') >> 20} MB"
-    except (OSError, ValueError, AttributeError):
-        ram = ""
+    ram = f"; RAM {r} MB" if (r := ram_mb()) else ""     # tendência visível sem ferramenta
     logger.info(f"faxina diária: {apagados} anúncios velhos apagados; backup {bak.name} "
                 f"({bak.stat().st_size // 1024} KB){ram}")
+
+
+def ram_mb() -> int | None:
+    """RAM (RSS) do processo em MB; None fora do Linux."""
+    try:
+        return int(Path("/proc/self/statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE") >> 20
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def _proximo(intervalo_min: int) -> str:
@@ -244,7 +252,9 @@ _CAMPOS_BUSCA = ("nome", "tipo", "termo", "criterios_inclusao", "criterios_exclu
 _MUDA_SCAN = {"tipo", "termo", "estado", "preco_min", "preco_max", "filtro_envio",
               "filtro_vendedor", "garantia", "filtros_extra"}
 _MUDA_AVALIACAO = {"tipo", "termo", "criterios_inclusao", "criterios_exclusao",
-                   "instrucoes", "filtros_extra", "condicao", "categorias"}
+                   "instrucoes", "filtros_extra", "condicao", "categorias", "preco_max"}
+# mudou o produto/onde se procura -> a mediana de mercado medida não vale mais
+_MUDA_MERCADO = {"tipo", "termo", "estado", "filtro_vendedor", "filtros_extra", "categorias", "condicao"}
 
 
 def _serializar(campos: dict) -> dict:
@@ -280,6 +290,8 @@ def atualizar_busca(busca_id: int, dados: dict) -> set:
         if mudou & _MUDA_SCAN:
             conn.execute("UPDATE buscas SET fase='scan', proximo_scan=datetime('now') "
                          "WHERE id=?", (busca_id,))
+        if mudou & _MUDA_MERCADO:
+            conn.execute("UPDATE buscas SET mercado='' WHERE id=?", (busca_id,))
         if mudou & _MUDA_AVALIACAO:
             conn.execute("INSERT OR IGNORE INTO fila (anuncio_id, busca_id, prioridade) "
                          "SELECT id, busca_id, 0 FROM anuncios WHERE busca_id=?", (busca_id,))
@@ -335,12 +347,16 @@ def forcar_scan(busca_id: int):
 
 def buscas_para_processar() -> list[dict]:
     """Buscas não pausadas cujo proximo_scan já passou ('erro' também: uma
-    falha de rede não pode matar a busca)."""
+    falha de rede não pode matar a busca). Agendada para além de 1 intervalo
+    (+10%) é impossível: o relógio do PC voltou no tempo (boot com hora
+    adiantada, corrigida depois pelo NTP) -> roda já; senão o bot ficaria
+    parado até o relógio alcançar a hora agendada."""
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT * FROM buscas
             WHERE status IN ('ativa', 'erro')
-              AND (proximo_scan IS NULL OR proximo_scan <= datetime('now'))
+              AND (proximo_scan IS NULL OR proximo_scan <= datetime('now')
+                   OR proximo_scan > datetime('now', '+' || (intervalo_min * 66) || ' seconds'))
             ORDER BY proximo_scan ASC
         """).fetchall()
         return [_row_to_dict(r) for r in rows]
@@ -357,12 +373,36 @@ def sem_sucesso_ha(busca_id: int, horas: int = 6) -> bool:
 def full_scan_vencido(busca_id: int) -> bool:
     """True se a busca não faz um scan COMPLETO há 24h. O monitor só lê as
     novidades; sem o full diário, ultima_vez dos anúncios profundos apodrece e
-    não dá pra saber o que expirou."""
+    não dá pra saber o que expirou. Data no futuro = relógio voltou: vencido."""
     with get_conn() as conn:
         r = conn.execute(
             "SELECT ultimo_scan_full IS NULL OR ultimo_scan_full <= datetime('now','-1 day') "
+            "OR ultimo_scan_full > datetime('now','+10 minutes') "
             "FROM buscas WHERE id=?", (busca_id,)).fetchone()
         return bool(r and r[0])
+
+
+def mercado_vencido(busca_id: int) -> bool:
+    """Busca com teto sem medição de mercado nas últimas 24 h (ou do futuro:
+    relógio voltou)."""
+    with get_conn() as conn:
+        # CASE: json_extract em '' dá erro de JSON e o SQL não garante curto-circuito
+        r = conn.execute("""SELECT CASE WHEN preco_max > 0 AND json_valid(mercado) THEN COALESCE(
+                                json_extract(mercado, '$.em') <= datetime('now', '-1 day')
+                                OR json_extract(mercado, '$.em') > datetime('now', '+10 minutes'), 1)
+                            ELSE preco_max > 0 END
+                            FROM buscas WHERE id=?""", (busca_id,)).fetchone()
+        return bool(r and r[0])
+
+
+def salvar_mercado(busca_id: int, resumo: dict):
+    """Guarda a medição (hora em SQL, como todo timestamp comparado) e reavalia
+    em silêncio os anúncios da busca: a nota depende da mediana."""
+    with get_conn() as conn:
+        conn.execute("UPDATE buscas SET mercado=json_set(?, '$.em', datetime('now')) WHERE id=?",
+                     (json.dumps(resumo, ensure_ascii=False), busca_id))
+        conn.execute("INSERT OR IGNORE INTO fila (anuncio_id, busca_id, prioridade) "
+                     "SELECT id, busca_id, -1 FROM anuncios WHERE busca_id=?", (busca_id,))
 
 
 def concluir_scan(busca_id: int, intervalo_min: int, scan_completo: bool):
@@ -513,7 +553,7 @@ def obter_fila_pendente(limite: int = 5000) -> list[dict]:
                    (a.ultima_vez >= datetime('now','-2 days')) AS ativo,
                    (SELECT gostou FROM feedback fb WHERE fb.anuncio_id = a.id) AS feedback,
                    b.termo, b.tipo, b.criterios_inclusao, b.criterios_exclusao,
-                   b.nome, b.instrucoes, b.condicao, b.categorias, b.preco_max
+                   b.nome, b.instrucoes, b.condicao, b.categorias, b.preco_max, b.mercado
             FROM fila f
             JOIN anuncios a ON a.id = f.anuncio_id
             JOIN buscas   b ON b.id = f.busca_id
@@ -590,7 +630,7 @@ def salvar_avaliacoes(lote: list[tuple[int, int, dict]]):
 
 
 def busca_recente(busca_id: int) -> bool:
-    """Criada há menos de 24h — o dono ainda espera o resultado do 1º scan."""
+    """Criada há menos de 24h — o usuário ainda espera o resultado do 1º scan."""
     with get_conn() as conn:
         r = conn.execute("SELECT criado_em >= datetime('now','-1 day') FROM buscas "
                          "WHERE id=?", (busca_id,)).fetchone()
@@ -603,6 +643,20 @@ def analise_de(anuncio_id: int) -> dict | None:
         r = conn.execute("SELECT decisao, recomendacao, alerta FROM analises WHERE anuncio_id=?",
                          (anuncio_id,)).fetchone()
         return dict(r) if r else None
+
+
+def alertados_mesmo_local(busca_id: int, anuncio_id: int, local: str, preco: float) -> list[dict]:
+    """Já alertados da busca nos últimos 14 dias, mesmo local e preço até 10%
+    abaixo ou 3% acima: candidatos a 'o mesmo anúncio, republicado'. Repostado
+    3%+ mais barato é novidade (mesmo limiar do alerta de queda): fica de fora."""
+    if not local or not preco:
+        return []
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute("""
+            SELECT id, titulo, primeira_vez >= datetime('now', '-1 day') AS recente FROM anuncios
+            WHERE busca_id=? AND id!=? AND notificado=1 AND local=?
+              AND preco BETWEEN ? AND ? AND primeira_vez >= datetime('now','-14 days')
+        """, (busca_id, anuncio_id, local, preco * 0.9, preco * 1.03))]
 
 
 def marcar_notificado(anuncio_id: int):
@@ -742,7 +796,7 @@ def _row_to_dict(row) -> dict:
         return {}
     d = dict(row)
     for k in ("pros", "contras", "observacoes", "criterios_inclusao", "criterios_exclusao",
-              "filtros_extra", "categorias"):
+              "filtros_extra", "categorias", "mercado"):
         if k in d and isinstance(d[k], str):
             try:
                 d[k] = json.loads(d[k])

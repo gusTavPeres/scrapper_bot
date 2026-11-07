@@ -50,7 +50,7 @@ def criar(**kw) -> int:
 def anuncio_olx(lid, titulo, preco, **kw):
     return {"subject": titulo, "url": f"https://go.olx.com.br/x/anuncio-{lid}", "listId": lid,
             "priceValue": f"R$ {preco:,}".replace(",", "."), "date": 1792716949,
-            "location": "Goiânia", "professionalAd": False, "olxPay": {"enabled": False},
+            "location": "São Paulo", "professionalAd": False, "olxPay": {"enabled": False},
             "images": [{"original": f"https://img.olx.com.br/{lid}.jpg"}],
             "properties": [{"name": "category", "label": "Categoria", "value": "X"}], **kw}
 
@@ -115,6 +115,17 @@ async def _sem_espera(*a, **k):
 
 _sleep_real = asyncio.sleep
 scheduler.asyncio.sleep = _sem_espera      # paginação sem os 1,5 s reais
+
+
+class _SemRede:
+    """Sessão HTTP não simulada = erro, nunca a OLX real (a medição de mercado
+    roda dentro do processar_busca e usaria a rede em testes que só trocam o
+    raspar_busca)."""
+    def __init__(self, *a, **k):
+        raise RuntimeError("teste tentou usar a rede real (scheduler._sessao)")
+
+
+scheduler._sessao = _SemRede
 
 
 # ═══ PARTE 1 — RASPAGEM ═══════════════════════════════════
@@ -337,10 +348,11 @@ def test_p2_erro_agenda_retentativa():
         raise scheduler.OlxIndisponivel("403")
     scheduler.raspar_busca = _fake_raspar(efeito=falha)
     alertas = []
-    notifier.alertar = lambda chave, texto, horas=12: alertas.append(chave)
+    notifier.alertar = lambda chave, texto, horas=12: alertas.append(chave) or True
     rodar(scheduler.processar_busca(db.obter_busca(bid)))
     b = db.obter_busca(bid)
-    assert b["status"] == "erro" and not db.buscas_para_processar() and alertas == ["olx"]
+    # 403 passageiro: só log (o alerta depois de 1 h sem ler: test_p10_bloqueio_passageiro)
+    assert b["status"] == "erro" and not db.buscas_para_processar() and alertas == []
 
 
 def test_p2_migracao_v1():
@@ -390,7 +402,7 @@ def test_p2_migracao_v1():
     assert sql("SELECT descricao FROM anuncios WHERE id=1")[0][0] == ""
     assert sql("PRAGMA user_version")[0][0] == db.VERSAO_SCHEMA
     # busca criada DEPOIS da migração, num banco cujo DEFAULT de status era 'pendente'
-    sql("UPDATE buscas SET proximo_scan=datetime('now','+1 day')")
+    sql("UPDATE buscas SET proximo_scan=datetime('now','+20 minutes')")    # dentro do intervalo
     nova = criar(termo="rtx 5070")
     assert db.obter_busca(nova)["status"] == "ativa"
     assert [b["id"] for b in db.buscas_para_processar()] == [nova]
@@ -478,6 +490,16 @@ def test_p3_identidade():
         ("rtx 5070", "EVGA RTX 3080 FTW3 ULTRA (melhor CxB entre RTX 5050 5060 5060Ti 4060 4070 e 5070)", False),
         ("rtx 5070", "RTX 3080 melhor que a 5070", False), ("rtx 5070", "RTX 5070 melhor que a 4070", True),
         ("rtx 5070", "RTX 5070 12GB 2475MHz 6144 cuda", True),
+        # comparação entre parênteses e "troca pra" (com a nota pelo
+        # mercado, produto errado barato pareceria pechincha)
+        ("rtx 5070", "Placa de Vídeo RX 6900 XT (RTX 5070) 16Gb", False),
+        ("rtx 5070 ti", "Rtx 5070 gigabyte troca pra 5070 ti", False),
+        ("rtx 5070", "Rtx 5070 gigabyte troca pra 5070 ti", True),
+        ("rtx 5070", "Placa de vídeo (RTX 5070) Galax 12GB", True),
+        ("rtx 5070", "RTX 5070 Galax (RTX 5070 OC) 12GB", True),
+        ("rtx 5070", "RTX 3060 12GB, equivale a uma 5070 no DLSS", False),
+        ("rtx 5070", "RX 6800 16GB desempenho de RTX 5070", False),
+        ("rtx 5070 ti", "Troco RTX 5070 Ti por 5070 + volta", True),
         ("rtx 3090", "GPU NVIDIA Original GA102-300-A1 RTX 3090 | Chip Gráfico Testado", False), ("rtx 5060", "Fontes para RTX 5060", False),
     ]
     erros = [(t, ti, ok) for t, ti, ok in casos if produto_bate(t, ti)[0] != ok]
@@ -1230,6 +1252,19 @@ def test_p6_app_sobe_por_main_py():
         else:
             raise AssertionError("main.py não subiu")
         assert (Path(tmp) / "data" / "bot.db").exists()     # banco criado do zero
+        # WebSocket do painel: sem compressão e sem vazar (a config antiga do uvicorn
+        # prendia ~76 KB de memória nativa por conexão: 300 conexões = +22 MB)
+        import base64, websockets
+        cab = {"Authorization": "Basic " + base64.b64encode(b"u:p").decode()}
+        rss = lambda: int(Path(f"/proc/{proc.pid}/statm").read_text().split()[1]) * 4096 >> 20
+        async def conecta(n):
+            for _ in range(n):
+                async with websockets.connect(f"ws://127.0.0.1:{porta}/ws", additional_headers=cab) as w:
+                    assert not w.response.headers.get("Sec-WebSocket-Extensions")
+        rodar(conecta(50))
+        antes = rss()
+        rodar(conecta(300))
+        assert rss() - antes < 6, (antes, rss())
     finally:
         proc.terminate(); proc.wait(5)
 
@@ -1565,14 +1600,14 @@ def test_p7_watchdog_reinicia_quem_travou():
     orig = (main.asyncio.sleep, main.os._exit, scheduler.ultimo_ciclo)
     main.asyncio.sleep, main.os._exit = sleep, lambda code: saidas.append(code)
     try:
-        scheduler.ultimo_ciclo = time.time()                              # saudável: não mata
+        scheduler.ultimo_ciclo = time.monotonic()                         # saudável: não mata
         try:
             rodar(main._watchdog())
         except asyncio.CancelledError:
             pass
         assert saidas == []
         esperas.clear()
-        scheduler.ultimo_ciclo = time.time() - 3000                       # travado há 50 min
+        scheduler.ultimo_ciclo = time.monotonic() - 3000                  # travado há 50 min
         try:
             rodar(main._watchdog())
         except asyncio.CancelledError:
@@ -1909,6 +1944,376 @@ def test_p9_regra_nova_reavalia_o_banco():
     assert not n.enviados and not n.resumos
 
 
+# ═══ PARTE 10 — RELÓGIO, BLOQUEIO, TROCA E REPUBLICAÇÃO ════
+
+def test_p10_relogio_voltou():
+    """Boot com o relógio do PC adiantado; corrigido pelo NTP, o proximo_scan
+    ficava horas no futuro e o bot parava, mudo."""
+    novo_banco()
+    bid = criar()
+    sql("UPDATE buscas SET fase='monitor', ultimo_scan_full=datetime('now'), "
+        "proximo_scan=datetime('now','+32 minutes')")
+    assert not db.buscas_para_processar()                          # dentro de 1 intervalo: espera
+    sql("UPDATE buscas SET proximo_scan=datetime('now','+20 hours')")
+    assert [b["id"] for b in db.buscas_para_processar()] == [bid]  # impossível: roda já
+    assert not db.full_scan_vencido(bid)
+    sql("UPDATE buscas SET ultimo_scan_full=datetime('now','+20 hours')")
+    assert db.full_scan_vencido(bid)
+    db.manutencao_diaria()
+    bak = db.DB_PATH.with_suffix(".db.bak")
+    futuro = time.time() + 20 * 3600                               # backup "do futuro"
+    os.utime(bak, (futuro, futuro))
+    db.manutencao_diaria()
+    assert bak.stat().st_mtime < futuro                            # a faxina não espera 44 h
+    # debounce no relógio monotônico, que começa perto de 0 no boot: o 1º aviso
+    # não pode ser engolido como se o anterior tivesse sido "há pouco"
+    import importlib, types
+    n = importlib.reload(notifier)
+    enviados = []
+    n._enviar = lambda t: enviados.append(t) or True
+    n.time = types.SimpleNamespace(monotonic=lambda: 100.0)        # 100 s depois do boot
+    try:
+        assert n.alertar("k", "a") and not n.alertar("k", "b") and enviados == ["a"]
+    finally:
+        importlib.reload(notifier)                                 # devolve o módulo time
+
+
+def test_p10_bloqueio_passageiro():
+    """403 do Cloudflare em ondas de ~30 min: o bot se recupera sozinho, então
+    uma onda não pode mandar 'OLX indisponível… as buscas estão paradas'."""
+    novo_banco()
+    bid = criar()
+    falha = [True]
+    async def raspar(busca, fase):
+        if falha[0]:
+            raise scheduler.OlxIndisponivel("403 (bloqueio) em https://www.olx.com.br/x")
+        return []
+    scheduler.raspar_busca, scheduler._preencher_descricoes = raspar, _sem_espera
+    alertas = []
+    notifier.alertar = lambda chave, texto, horas=12: alertas.append((chave, texto)) or True
+    scheduler._olx_falha_desde, scheduler._olx_alertado = None, False
+    passa = lambda: rodar(scheduler.processar_busca(db.obter_busca(bid)))
+    passa()
+    assert alertas == []                  # 1ª falha nunca alarma (nem em busca diária)
+    scheduler._olx_falha_desde -= 3601                             # falhando há 1 h
+    passa(); passa()
+    assert [c for c, _ in alertas] == ["olx"] and "há 60 min" in alertas[0][1], alertas   # 1 aviso
+    falha[0] = False
+    passa(); passa()
+    assert [c for c, _ in alertas] == ["olx", "olx_voltou"], alertas    # avisa a volta, 1x
+    falha[0] = True
+    passa()
+    assert len(alertas) == 2                                       # conta do zero de novo
+
+
+def test_p10_anuncio_so_de_troca():
+    """'Troco rtx 5060 por rx 9060xt' não é venda: não pode virar 🟢 COMPRAR."""
+    troca = _item(termo="rtx 5060", preco_max=1900, preco=1900,
+                  titulo="Troco rtx 5060 por rx 9060xt de 16gb. Pago mais um valor na troca.",
+                  descricao="Placa nova, pouco usada. Raramente utilizo o pc para jogar. Estou "
+                            "querendo trocar por uma rx 9060xt de 16gb. Pago mais um valor na troca.")
+    av = avaliar(troca, [])
+    assert av["decisao"] == "APROVADO" and av["recomendacao"] == "VER" and not av["alerta"], av
+    assert any("TROCA" in c for c in av["contras"]), av
+    for titulo, desc in (("Vendo ou troco RTX 5060", troca["descricao"]),
+                         ("RTX 5060 - aceito troca", troca["descricao"]),
+                         ("Troco RTX 5060", "Vendo por 1900 ou troco por RX 9060 XT, nota fiscal e caixa.")):
+        av = avaliar({**troca, "titulo": titulo, "descricao": desc}, [])
+        assert not any("TROCA" in c for c in av["contras"]), (titulo, av)
+    nega = avaliar({**troca, "titulo": "Troco RTX 5060", "descricao": "Não vendo, só troco por RX 9060 XT."}, [])
+    assert any("TROCA" in c for c in nega["contras"]) and not nega["alerta"], nega   # venda negada
+
+
+def test_p10_republicacao_nao_realerta():
+    """Vendedor que apaga e reposta o anúncio (igual ou com o título reordenado)
+    não gera um alerta a cada cópia."""
+    novo_banco()
+    bid = criar(termo="rtx 5060", preco_max=1900)
+    sql("UPDATE buscas SET criado_em=datetime('now','-3 days')")
+    seq = iter(range(5000000, 5000100))
+    def anuncio(titulo, preco=1800, local="Cidade A, Bairro 1"):
+        lid = next(seq)
+        aid, _, _ = db.upsert_anuncio(bid, {"url": f"https://x/a-{lid}", "list_id": lid,
+                                            "titulo": titulo, "preco": preco, "local": local})
+        db.atualizar_descricao(aid, bid, _item()["descricao"])
+        return aid
+    n = NotifierFalso()
+    t = "VENDO RTX 5060 MSI - R$ 1.800,00"
+    a1, a2 = anuncio(t), anuncio(t)                                # 2 cópias na mesma rodada
+    rodar(avaliador.processar_fila(n))
+    assert len(n.enviados) == 1, n.enviados
+    a3 = anuncio(t, preco=1750)                                    # rodada seguinte, -3%
+    rodar(avaliador.processar_fila(n))
+    assert len(n.enviados) == 1
+    assert all(sql("SELECT notificado FROM anuncios WHERE id=?", a)[0][0] for a in (a1, a2, a3))
+    g1 = anuncio("Placa de Vídeo Galax RTX 5060 8GB GDDR7 2K. (Apenas retirada nao envio)", local="Cidade B, Bairro 2")
+    rodar(avaliador.processar_fila(n))
+    g2 = anuncio("(nao envio apenas retirada )Placa de Vídeo Galax RTX 5060 8GB GDDR7 2K", local="Cidade B, Bairro 2")
+    rodar(avaliador.processar_fila(n))
+    assert n.enviados == [n.enviados[0], g1], n.enviados           # a reordenada não alerta
+    # NÃO são republicação: outro local, outro preço
+    outros = [anuncio(t, local="Cidade C, Bairro 3"), anuncio(t, preco=1500)]
+    rodar(avaliador.processar_fila(n))
+    assert sorted(n.enviados[2:]) == sorted(outros), (n.enviados, outros)
+    # o mesmo vendedor, 1 h depois, outro título e +50: em 24 h, local e preço bastam
+    c1 = anuncio("Placa de Vídeo 5060", preco=1400, local="Cidade D, Bairro 4")
+    rodar(avaliador.processar_fila(n))
+    anuncio("RTX 5060 8GB", preco=1450, local="Cidade D, Bairro 4")
+    rodar(avaliador.processar_fila(n))
+    assert n.enviados[-1] == c1, n.enviados
+    # passadas 24 h, só o título quase igual segura: outra marca no mesmo lugar alerta
+    sql("UPDATE anuncios SET primeira_vez=datetime('now','-2 days')")
+    marca = anuncio("VENDO RTX 5060 GALAX - R$ 1.800,00")
+    rodar(avaliador.processar_fila(n))
+    anuncio(t)                                                     # o mesmo título (MSI) não
+    rodar(avaliador.processar_fila(n))
+    assert n.enviados[-1] == marca, n.enviados
+    sql("UPDATE anuncios SET primeira_vez=datetime('now','-15 days')")
+    velho = anuncio(t)
+    rodar(avaliador.processar_fila(n))
+    assert n.enviados[-1] == velho                                 # 15 dias depois: alerta de novo
+    mais_barato = anuncio(t, preco=1740)                           # repostado 3% mais barato: novidade
+    rodar(avaliador.processar_fila(n))
+    assert n.enviados[-1] == mais_barato, n.enviados
+
+
+# ═══ PARTE 11 — MERCADO, RAM E WEBSOCKET ══════════════════
+
+_MERC_3090 = {"n": 40, "mediana": 7200, "variantes": {}}
+
+
+def test_p11_nota_pelo_mercado():
+    """Com teto, só PECHINCHA alerta: no teto (6.000) com o mercado a 7.200 é o
+    preço normal (VER, sem alerta); bem abaixo do mercado é pechincha; metade
+    do mercado é suspeito. Acima do teto continua a regra do teto."""
+    it = lambda **kw: _item(preco_max=6000, mercado=_MERC_3090, **kw)
+    normal = avaliar(it(preco=6000), [])
+    assert normal["recomendacao"] == "VER" and not normal["alerta"] and normal["avaliacao_preco"] == "justo", normal
+    assert normal["preco_vs_mercado_pct"] == -17 and any("não é pechincha" in o for o in normal["observacoes"])
+    pech = avaliar(it(preco=5500), [])
+    assert pech["recomendacao"] == "COMPRAR" and pech["alerta"] == "comprar" and pech["referencia"] == "mercado", pech
+    assert "vs mercado R$ 7.200 de 40 anúncios" in pech["resumo"] and "pechincha: 24%" in pech["motivo"]
+    # metade do mercado mas dentro do teto: ⚠️ (antes do mercado era 🟢; a 1ª versão calava)
+    golpe = avaliar(it(preco=3000), [])                              # -58%, 50% do teto
+    assert golpe["avaliacao_preco"] == "suspeito" and golpe["alerta"] == "suspeita", golpe
+    assert golpe["recomendacao"] == "VER" and any("metade do mercado" in o for o in golpe["observacoes"]), golpe
+    lixo = avaliar(it(preco=2500), [])                               # -65% E < 45% do teto: cala
+    assert lixo["avaliacao_preco"] == "suspeito" and not lixo["alerta"], lixo
+    # teto em ~metade do mercado: tudo no teto vira ⚠️ ou 🟢, nada some
+    m80 = {"n": 49, "mediana": 12499}
+    r80 = {p: avaliar(_item(termo="rtx 5080", titulo="RTX 5080 16GB Gigabyte", preco=p,
+                            preco_max=6300, mercado=m80), []) for p in (2800, 4000, 6000, 6300)}
+    assert [r80[p]["alerta"] for p in (2800, 4000, 6000, 6300)] == ["", "suspeita", "suspeita", "comprar"], r80
+    acima = avaliar(it(preco=6500, descricao=_item()["descricao"] + " Aceito proposta."), [])
+    assert acima["avaliacao_preco"] == "negociavel" and acima["referencia"] == "teto" and "vs seu teto" in acima["resumo"]
+    sem = avaliar(_item(preco_max=6000, preco=6000), [])            # sem medição: regra do teto
+    assert sem["recomendacao"] == "COMPRAR" and sem["referencia"] == "teto", sem
+    defeito = avaliar(it(preco=2000, termo="rtx 3090 com defeito",
+                         descricao="Placa com defeito, não dá vídeo, para reparo."), [])
+    assert "vs mercado" not in defeito["resumo"], defeito          # mercado é de placa boa
+    # variante: 5060 Ti de 16 GB tem outro mercado que a de 8 GB
+    m = avaliador.resumo_mercado([(3000 + 20 * i, "8gb") for i in range(8)]
+                                 + [(4400 + 40 * i, "16gb") for i in range(6)] + [(3300, "")])
+    assert m["variantes"] == {"8gb": {"n": 8, "mediana": 3070}, "16gb": {"n": 6, "mediana": 4500}}, m
+    ti = lambda t, p: avaliar(_item(termo="rtx 5060 ti", titulo=t, preco=p, preco_max=3500, mercado=m), [])
+    assert ti("RTX 5060 Ti 16GB Asus", 3400)["preco_vs_mercado_pct"] == -24      # vs 4.500 (16 GB)
+    assert ti("RTX 5060 Ti 8 GB Galax", 3000)["avaliacao_preco"] == "justo"      # vs 3.070 (8 GB)
+    # título sem a memória: vale o atributo da OLX ("VRAM: 16 GB")
+    attr = avaliar(_item(termo="rtx 5060 ti", titulo="RTX 5060 Ti Asus", preco=3400, preco_max=3500, mercado=m,
+                         atributos="Marca: Nvidia · Memória de Vídeo - VRAM: 16 GB"), [])
+    assert attr["preco_vs_mercado_pct"] == -24, attr
+    # muito abaixo do mercado (mas não a metade): alerta, com o aviso de golpe
+    fundo = avaliar(it(preco=4000), [])                              # -44% vs 7.200
+    assert fundo["alerta"] == "comprar" and any("nunca pague adiantado" in o for o in fundo["observacoes"]), fundo
+    assert not any("adiantado" in o for o in pech["observacoes"])  # -24%: sem o aviso
+    # barato demais + sinal de golpe (descrição curta, WhatsApp, pressa) = ⚠️, nunca 🟢
+    for desc in ("Placa com 3 meses de uso. Seminova.",
+                 _item()["descricao"] + " Chama no whats (11) 99999-0000.",
+                 _item()["descricao"] + " Para vender rápido."):
+        sus = avaliar(it(preco=4000, descricao=desc), [])
+        assert sus["alerta"] == "suspeita" and sus["recomendacao"] == "VER", (desc, sus)
+        assert any("padrão comum de golpe" in o for o in sus["observacoes"]), sus
+    assert avaliar(it(preco=5000, descricao="Placa com 3 meses de uso. Seminova."), [])["alerta"] != "suspeita"  # -31%
+    assert avaliador.resumo_mercado([(1000, "")] * 4) is None                     # amostra pequena
+    assert avaliador.resumo_mercado([(100, ""), (500, ""), (2000, ""), (9000, ""), (30000, "")]) is None  # misturado
+    # o alerta diz contra o quê comparou
+    textos, foto = [], notifier._enviar_foto
+    notifier._enviar_foto = lambda *a, **k: False
+    notifier._enviar = lambda t, b=None: textos.append(t) or True
+    try:
+        rodar(notifier.enviar_resultado({"preco_max": 6000, "titulo": "RTX 3090", "preco": 5500}, pech))
+        rodar(notifier.enviar_resultado({"preco_max": 6000, "titulo": "RTX 3090", "preco": 6500}, acima))
+    finally:
+        notifier._enviar_foto = foto
+    assert "-24% vs mercado" in textos[0] and "+8% vs seu teto" in textos[1], textos
+    rodar(notifier.enviar_resultado({"preco_max": 6000, "titulo": "RTX 3090", "preco": 4000}, sus))
+    assert "PECHINCHA SUSPEITA" in textos[2] and "COMPRAR" not in textos[2], textos[2]
+
+
+def test_p11_mercado_medido_sem_teto():
+    """1x/dia a busca com teto é lida SEM o &pe= (até 5 págs): só o produto
+    certo, sem defeito, com preço; falha não derruba a busca."""
+    novo_banco()
+    bid = criar(termo="rtx 5060 ti", preco_max=2300)
+    ads = ([anuncio_olx(6000000 + i, "RTX 5060 Ti 8GB Galax", 3000 + 20 * i) for i in range(8)]
+           + [anuncio_olx(6000100 + i, "RTX 5060 Ti 16GB Asus", 4400 + 40 * i) for i in range(6)]
+           + [anuncio_olx(6000200, "PC Gamer RTX 5060 Ti", 6000), anuncio_olx(6000201, "RTX 5060 Ti com defeito", 900),
+              anuncio_olx(6000202, "RTX 5060 Ti 8GB a combinar", 0)])
+    olx = OlxFalsa({"pe=": (200, pagina_olx([anuncio_olx(6000300, "RTX 5060 Ti 8GB", 2200)])),
+                    "o=1&sf=1": (200, pagina_olx(ads))})
+    scheduler._sessao, scheduler._preencher_descricoes = olx, _sem_espera
+    rodar(scheduler.processar_busca(db.obter_busca(bid)))
+    sem_teto = [u for u in olx.paginas() if "pe=" not in u]
+    assert len(sem_teto) == 2 and all("q=rtx%205060%20ti" in u for u in sem_teto), olx.paginas()   # pág 1 e a vazia
+    b = db.obter_busca(bid)
+    assert (b["mercado"]["n"], b["mercado"]["mediana"]) == (14, 3130) and b["mercado"]["em"], b["mercado"]
+    assert b["mercado"]["variantes"]["16gb"]["mediana"] == 4500 and b["status"] == "ativa"
+    assert not db.mercado_vencido(bid) and f"mercado ~R$ 3.130" in tb.tratar_comando("/buscas")
+    n = len(olx.pedidos)
+    rodar(scheduler.processar_busca(db.obter_busca(bid)))
+    assert all("pe=" in u for u in olx.pedidos[n:]), olx.pedidos[n:]         # medido hoje: não repete
+    # anúncio coletado foi reavaliado com o mercado (8 GB a 2.200 vs 3.070 = pechincha)
+    rodar(avaliador.processar_fila(None))
+    assert "vs mercado" in sql("SELECT resumo FROM analises")[0][0]
+    sql("UPDATE buscas SET mercado=json_set(mercado, '$.em', datetime('now','-25 hours'))")
+    assert db.mercado_vencido(bid)
+    olx.rotas = {"pe=": (200, pagina_olx([])), "o=1&sf=1": (403, "")}             # bloqueio só na medição
+    rodar(scheduler.processar_busca(db.obter_busca(bid)))
+    b = db.obter_busca(bid)
+    assert b["status"] == "ativa" and b["mercado"]["mediana"] == 3130 and db.mercado_vencido(bid)  # tenta de novo
+    olx.rotas = {"pe=": (200, pagina_olx([])), "o=1&sf=1": (200, pagina_olx(ads[:3]))}   # amostra pequena
+    rodar(scheduler.processar_busca(db.obter_busca(bid)))
+    assert db.obter_busca(bid)["mercado"].get("mediana") is None and not db.mercado_vencido(bid)  # sem nota, sem remedir
+    # sem teto não mede; trocar o produto zera a medição; trocar o teto reavalia
+    assert not db.mercado_vencido(criar(termo="rtx 4090"))
+    db.atualizar_busca(bid, {"termo": "rtx 5070"})
+    assert db.obter_busca(bid)["mercado"] == ""
+    sql("DELETE FROM fila")
+    db.atualizar_busca(bid, {"preco_max": 2415})
+    assert sql("SELECT COUNT(*) FROM fila WHERE prioridade=0")[0][0] >= 1
+
+
+def test_p11_vigia_ram():
+    """malloc_trim depois de cada rodada com busca; 1 linha no log quando a RAM
+    fica 5+ MB acima da última anotação (mostra em que evento ela cresce)."""
+    linhas, trims = [], []
+    h = logging.Handler(); h.emit = lambda r: linhas.append(r.getMessage())
+    lg = logging.getLogger("scheduler"); lg.addHandler(h); lg.setLevel(logging.INFO)
+    orig = (scheduler._malloc_trim, db.ram_mb, scheduler._ram_base)
+    seq = iter([70, 72, 76, 75, 69, 74, 80])
+    scheduler._malloc_trim, db.ram_mb, scheduler._ram_base = (lambda n: trims.append(n) or 1), (lambda: next(seq)), 0
+    try:
+        for _ in range(7):
+            scheduler._vigiar_ram()
+    finally:
+        lg.removeHandler(h); lg.setLevel(logging.NOTSET)
+        scheduler._malloc_trim, db.ram_mb, scheduler._ram_base = orig
+    assert trims == [0] * 7
+    assert [x.split(" (")[0] for x in linhas if "RAM" in x] == ["RAM subiu: 76 MB", "RAM subiu: 74 MB",
+                                                                "RAM subiu: 80 MB"], linhas
+    assert db.ram_mb() and scheduler._malloc_trim                   # Linux/glibc de verdade
+    assert "anônima" in linhas[0] and "objetos Python" in linhas[0], linhas[0]
+    # teto: acima de RAM_MAX sai com 1 (systemd/compose sobem de novo), com o detalhe no log
+    saidas, orig = [], (scheduler._malloc_trim, db.ram_mb, os._exit)
+    lg.addHandler(h)
+    scheduler._malloc_trim, db.ram_mb, os._exit = (lambda n: 1), (lambda: scheduler.RAM_MAX + 1), saidas.append
+    try:
+        scheduler._vigiar_ram()
+    finally:
+        lg.removeHandler(h)
+        scheduler._malloc_trim, db.ram_mb, os._exit = orig
+    assert saidas == [1] and any("reiniciando o processo" in x and "anônima" in x for x in linhas), linhas
+    # o ciclo só vigia quando alguma busca rodou
+    novo_banco()
+    chamadas = []
+    orig_v = scheduler._vigiar_ram
+    scheduler._vigiar_ram = lambda: chamadas.append(1)
+    try:
+        sql("UPDATE buscas SET proximo_scan=datetime('now','+1 minute')")
+        rodar(scheduler.ciclo())
+        assert chamadas == []
+        criar()
+        scheduler.raspar_busca, scheduler._preencher_descricoes = _fake_raspar([]), _sem_espera
+        rodar(scheduler.ciclo())
+        assert chamadas == [1]
+    finally:
+        scheduler._vigiar_ram = orig_v
+
+
+def test_p11_polling_solta_ciclo_da_excecao():
+    """Vazamento de RAM: cada timeout do long-poll do Telegram deixava um ciclo
+    (frame do urllib3 <-> exceção) prendendo a conexão e o contexto TLS com os
+    certificados, ~0,7 MB (reproduzido: 120 timeouts, 39 -> 123 MB). O GC
+    automático, com o processo ocioso, não o recolhia. Aqui ele fica
+    desligado: só o gc.collect() do próprio loop solta. O último ciclo pode seguir
+    preso por 1-2 voltas (o asyncio ainda o referencia); o que importa é não acumular."""
+    import gc
+    import weakref
+    class Pesado:
+        pass
+    refs, vivos = [], []
+    def get(url, params=None, timeout=None):
+        vivos.append(sum(r() is not None for r in refs))
+        if len(refs) == 6:
+            raise asyncio.CancelledError
+        obj = Pesado()
+        refs.append(weakref.ref(obj))
+        erro = tb.requests.exceptions.ReadTimeout("expirou")
+        erro.ciclo = [erro, obj]                  # como o frame que guarda a exceção
+        raise erro
+    dormir = asyncio.sleep
+    async def sem_espera(s):
+        await dormir(0)                           # cede a vez como o sleep de verdade
+    class Resp:
+        ok, status_code, text = True, 200, ""
+    orig = (tb.requests.get, tb.requests.post, tb.TOKEN, tb.CHAT_ID, asyncio.sleep)
+    tb.requests.get, tb.requests.post, tb.TOKEN, tb.CHAT_ID = get, lambda *a, **k: Resp(), "T", "42"
+    asyncio.sleep = sem_espera
+    gc.disable()
+    try:
+        try:
+            rodar(tb.loop_comandos())
+        except asyncio.CancelledError:
+            pass
+    finally:
+        gc.enable()
+        tb.requests.get, tb.requests.post, tb.TOKEN, tb.CHAT_ID, asyncio.sleep = orig
+    assert len(vivos) == 7 and max(vivos) <= 2, vivos      # sem o collect: 0,1,2,...,6
+
+
+def test_p11_pausa_apos_bloqueio():
+    """403/429: TODAS as buscas esperam 15 min (senão cada uma bate no bloqueio
+    por conta própria). Layout mudado não pausa."""
+    novo_banco()
+    criar(), criar(nome="outra", termo="rtx 4090")
+    chamadas = []
+    async def bloqueado(busca, fase):
+        chamadas.append(busca["id"])
+        raise scheduler.OlxIndisponivel("403 (bloqueio) em https://www.olx.com.br/x")
+    scheduler.raspar_busca, scheduler._preencher_descricoes = bloqueado, _sem_espera
+    notifier.alertar = lambda *a, **k: True
+    scheduler._olx_pausa_ate, scheduler._olx_falha_desde, scheduler._olx_alertado = 0.0, None, False
+    rodar(scheduler.ciclo())
+    assert len(chamadas) == 1, chamadas                            # a 2ª nem tentou
+    sql("UPDATE buscas SET proximo_scan=datetime('now','-1 minute')")
+    rodar(scheduler.ciclo())
+    assert len(chamadas) == 1                                      # 15 min de pausa
+    scheduler._olx_pausa_ate -= scheduler.OLX_PAUSA + 1            # passaram 15 min
+    async def ok(busca, fase):
+        chamadas.append(busca["id"])
+        return []
+    scheduler.raspar_busca = ok
+    rodar(scheduler.ciclo())
+    assert len(chamadas) == 3, chamadas                            # as duas voltam
+    async def layout(busca, fase):
+        chamadas.append(busca["id"])
+        raise scheduler.OlxIndisponivel("página sem flight data (layout mudou?): x")
+    scheduler.raspar_busca = layout
+    sql("UPDATE buscas SET proximo_scan=datetime('now','-1 minute')")
+    rodar(scheduler.ciclo())
+    assert len(chamadas) == 5 and scheduler._olx_pausa_ate < time.monotonic()   # não pausou
+
+
 def test_fd_leak():
     if not os.path.isdir("/proc/self/fd"):          # só Linux tem /proc
         return
@@ -1927,7 +2332,8 @@ if __name__ == "__main__":
         if so and f"_{so}_" not in nome:
             continue
         estado = [(m, k, getattr(m, k)) for m, ks in (
-            (scheduler, ("raspar_busca", "_preencher_descricoes", "_sessao", "processar_busca")),
+            (scheduler, ("raspar_busca", "_preencher_descricoes", "_sessao", "processar_busca",
+                        "_olx_falha_desde", "_olx_alertado", "_olx_pausa_ate")),
             (notifier, ("alertar", "enviar_queda", "_post", "_enviar", "TOKEN")),
             (tb, ("_enviar", "_post", "TOKEN", "CHAT_ID"))) for k in ks]
         try:

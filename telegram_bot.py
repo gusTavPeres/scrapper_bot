@@ -4,6 +4,7 @@ Só aceita comandos do CHAT_ID configurado no .env. Nunca configurar webhook
 neste bot: mataria o getUpdates.
 """
 import asyncio
+import gc
 import logging
 import os
 import re
@@ -185,6 +186,8 @@ def tratar_comando(texto: str) -> str:
             f"#{b['id']} <b>{esc(b['nome'])}</b> "
             f"{b['status'] if b['status'] != 'ativa' else b['fase']} · "
             f"🟢{b['total_comprar']} 🟡{b['total_ver']} ({b['total_anuncios']} anúncios)"
+            + (f" · mercado ~{avaliador._brl(m['mediana'])}"
+               if isinstance(m := b.get("mercado"), dict) and m.get("mediana") else "")
             for b in buscas)
 
     if cmd in ("add", "addcarro"):
@@ -308,7 +311,7 @@ def tratar_comando(texto: str) -> str:
 
 
 async def loop_comandos():
-    """Long-polling do getUpdates; responde só ao CHAT_ID do dono."""
+    """Long-polling do getUpdates; responde só ao CHAT_ID configurado."""
     if not TOKEN:
         logger.warning("telegram: sem TELEGRAM_TOKEN — notificações e comandos desativados")
         return
@@ -378,7 +381,15 @@ async def loop_comandos():
                     await asyncio.to_thread(_enviar, resposta)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
             # long-poll expirado ou conexão resetada — rotina de rede, sem alarde
-            await asyncio.sleep(2)
+            espera = 2
         except Exception as e:
             logger.warning(f"telegram polling: {sem_token(e)}")
-            await asyncio.sleep(5)
+            espera = 5
+        else:
+            continue
+        await asyncio.sleep(espera)
+        # a exceção do requests/urllib3 fica num ciclo (frame <-> exceção) que prende a
+        # conexão e o contexto TLS com os certificados, ~0,7 MB por timeout, e o GC
+        # automático quase não roda com o processo ocioso: a RAM crescia sem parar.
+        # Depois do sleep: até ceder a vez, a task ainda segura a exceção
+        gc.collect()

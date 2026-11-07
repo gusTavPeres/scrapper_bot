@@ -157,14 +157,29 @@ _CONECTIVOS = {"com", "de", "do", "da", "dos", "das", "para", "pra", "sem", "e",
 
 def termo_de_busca(termo: str) -> str:
     """Só as palavras de IDENTIDADE vão p/ a OLX. Ela busca em título E descrição;
-    palavras genéricas ('defeito', 'usada') normalmente não restringem (2026-10-22
-    23h: 'rtx 3090 com defeito' = 'rtx 3090' = 76), mas numa medição 1h antes
-    restringiram a 0 — comportamento instável da OLX. Tirá-las é inofensivo nos
+    palavras genéricas ('defeito', 'usada') normalmente não restringem, mas às vezes
+    zeram o resultado — comportamento instável da OLX. Tirá-las é inofensivo nos
     dois casos; o estado do produto quem julga é o avaliador, com a descrição."""
     ficam = [p for p in termo.split()
              if norm(p).strip(".,/") not in _CONECTIVOS | _DESCRITIVAS
              and not norm(p).startswith(("defeit", "quebrad"))]
     return " ".join(ficam) or termo
+
+
+_RE_TROCA = re.compile(r"\b(troco|troca|trocar)\s+(por|em|numa?|pra|para)\b(\s+\w+){0,2}\s*$")
+_RE_COMPARA = re.compile(r"(\b(melhor|pior|mais forte|mais rapida?|superior|inferior)\s+(que|a)\b|"
+                         r"\b(vs|versus|supera|bate)\b|\b(igual|equivalente|equivale|similar)\s+(a|uma?)\b|"
+                         r"\b(nivel|desempenho) de\b)(\s+\w+){0,2}\s*$")
+
+
+def _so_comparacao(ti: str, i: int) -> bool:
+    """O modelo na posição i é só referência de desempenho: depois de palavra
+    de comparação, ou sozinho entre parênteses depois de OUTRA placa ("RX 6900
+    XT (RTX 5070)"; "Placa (RTX 5070)", sem outra placa antes, é a própria)."""
+    if _RE_COMPARA.search(ti[max(0, i - 30):i]):
+        return True
+    m = re.search(r"\(\s*(?:nvidia\s+|geforce\s+)?(?:rtx|gtx|rx)?\s*$", ti[:i])
+    return bool(m and re.search(r"\b(?:rx|rtx|gtx|arc)\s*[a-z]?\d{3,4}", ti[:m.start()]))
 
 
 def produto_bate(termo: str, titulo: str) -> tuple[bool, str]:
@@ -189,7 +204,6 @@ def produto_bate(termo: str, titulo: str) -> tuple[bool, str]:
         if not ocorr:
             return False, f"título não menciona '{num}' (modelo diferente)"
         quer = _sufixos(t, num, m_t.start())
-        tem = [_sufixos(ti, num, i) for i in ocorr]
         # "RTX 4080/4090/5090", "(5060, 5070, 5080)": vários modelos no título
         # (vizinho = número de 3+ dígitos que não é memória: "RTX 3090, 24GB" é 1 modelo)
         if all(re.search(r"\d{3,}[a-z]*\s*[/,]\s*$", ti[:i])
@@ -197,19 +211,21 @@ def produto_bate(termo: str, titulo: str) -> tuple[bool, str]:
                            ti[i + len(num):])
                for i in ocorr):
             return False, f"título lista vários modelos ({num} é só um deles)"
-        # "RTX 3080 (melhor que a 5070)": o buscado é só termo de comparação
-        if all(re.search(r"(\b(melhor|pior|mais forte|mais rapida?|superior|inferior)\s+(que|a)\b|"
-                         r"\b(vs|versus|supera|bate)\b|\b(igual|equivalente|similar)\s+(a|uma?)\b|"
-                         r"\bnivel de\b)(\s+\w+){0,2}\s*$", ti[max(0, i - 30):i]) for i in ocorr):
-            return False, f"o {num} só aparece como comparação, não é o que está à venda"
-        # "RX 7600 - troco por rtx 5060": o buscado é o que o vendedor QUER
-        if all(re.search(r"\b(troco|troca|trocar)\s+(por|em|numa?)\b(\s+\w+){0,2}\s*$", ti[max(0, i - 40):i])
-               for i in ocorr):
-            return False, f"o {num} é o que o vendedor quer na TROCA, não o que vende"
+        # menção que é só comparação ("RTX 3080 (melhor que a 5070)", "RX 6900 XT
+        # (RTX 5070)") ou o que o vendedor QUER na troca ("RX 7600 troco por rtx
+        # 5060", "Rtx 5070 troca pra 5070 ti") não conta: o sufixo (Ti/Super) é
+        # checado só nas menções livres
+        troca = [i for i in ocorr if _RE_TROCA.search(ti[max(0, i - 40):i])]
+        comparacao = [i for i in ocorr if _so_comparacao(ti, i)]
+        livres = [i for i in ocorr if i not in troca and i not in comparacao]
+        if not livres:
+            return False, (f"o {num} é o que o vendedor quer na TROCA, não o que vende" if troca
+                           else f"o {num} só aparece como comparação, não é o que está à venda")
+        tem = [_sufixos(ti, num, i) for i in livres]
         if quer not in tem:
             achado = " ".join(sorted(tem[0])) or "sem sufixo"
             return False, f"{num} {achado} ≠ {num} {' '.join(sorted(quer)) or 'sem sufixo'}"
-        posicoes.append(ocorr[0])
+        posicoes.append(livres[0])
     palavras = [p for p in re.findall(r"[a-z]{4,}", t) if p not in _DESCRITIVAS]
     if palavras and not any(p in ti for p in palavras):
         return False, f"título não menciona nada da busca ({', '.join(palavras[:3])})"
@@ -366,6 +382,7 @@ POSITIVOS = [
     ("revisoes em dia", "revisões em dia"), ("revisad", "revisado"),
     ("laudo cautelar", "laudo cautelar"), ("chave reserva", "chave reserva"),
 ]
+_PRESSA = ("vender rapido", "venda rapida", "vendo rapido", "preciso vender", "urgente")
 _RE_CONTATO = re.compile(r"whats|\bzap\b|\bwpp\b|telegram|\(?\b\d{2}\)?\s*9\s?\d{4}[-\s]?\d{4}\b")
 
 
@@ -487,7 +504,7 @@ def referencia_preco(item: dict, comparaveis: list[dict]) -> tuple[float | None,
     q1, _, q3 = statistics.quantiles(precos, n=4)
     mediana = statistics.median(precos)
     # preços dispersos demais = produtos diferentes sob o mesmo nome ("geladeira",
-    # "ps4" com jogos): mediana sem sentido. Calibrado em 2026-10-22 com dados reais:
+    # "ps4" com jogos): mediana sem sentido. Calibrado com dados reais:
     # homogêneos (iPhone 11, RTX, carro/ano, consoles) 0,13-0,35; geladeira 1,18;
     # jogos 1,64; "ps4" misturado 2,2-4,3
     if (q3 - q1) / mediana > DISPERSAO_MAX:
@@ -500,6 +517,58 @@ DISPERSAO_MAX = 0.6
 
 def _brl(v: float) -> str:
     return "R$ " + f"{v:,.0f}".replace(",", ".")
+
+
+# ── MERCADO (busca com teto) ──────────────────────────────
+# Com teto, a OLX só devolve até teto+15%: a mediana dos coletados é a do que
+# cabe no bolso, não a do mercado. 1x/dia o scheduler lê a busca SEM o teto e
+# guarda a mediana; dentro do teto a nota diz se é PECHINCHA (caber no teto não
+# basta: o preço normal do mercado não é oportunidade) ou se é barato demais
+# p/ ser verdade (metade do mercado = golpe ou outro produto).
+MERCADO_PECHINCHA = -20      # % vs mediana do mercado
+MERCADO_SUSPEITO = -50
+
+
+def variante(titulo: str, atributos: str = "") -> str:
+    """Memória/armazenamento ('16gb', '256gb') do título ou, se ele não diz, dos
+    atributos da OLX ("VRAM: 8 GB"): a mesma placa com 8 e com 16 GB tem
+    mercados diferentes."""
+    for texto in (titulo, atributos):
+        if m := re.search(r"(?<![\d.,])(\d{1,4})\s?(gb|tb)\b", norm(texto or "")):
+            return m.group(1) + m.group(2)
+    return ""
+
+
+def resumo_mercado(precos: list[tuple[float, str]]) -> dict | None:
+    """[(preço, variante)] -> {"n", "mediana", "variantes": {v: {"n", "mediana"}}}.
+    Grupo com menos de 5 anúncios ou disperso demais (produtos misturados, a
+    mesma regra do referencia_preco) fica de fora."""
+    def grupo(vs):
+        if len(vs) < 5:
+            return None
+        q1, _, q3 = statistics.quantiles(vs, n=4)
+        med = statistics.median(vs)
+        return None if (q3 - q1) / med > DISPERSAO_MAX else {"n": len(vs), "mediana": round(med)}
+    geral = grupo([p for p, _ in precos])
+    if not geral:
+        return None
+    variantes = {v: g for v in sorted({v for _, v in precos if v})
+                 if (g := grupo([p for p, w in precos if w == v]))}
+    return {**geral, "variantes": variantes}
+
+
+def referencia_mercado(item: dict) -> tuple[float | None, int]:
+    """(mediana, n) do mercado p/ este anúncio: a da mesma variante se houver."""
+    m = item.get("mercado")
+    if isinstance(m, str):
+        try:
+            m = json.loads(m) if m else None
+        except ValueError:
+            m = None
+    if not isinstance(m, dict) or not m.get("mediana"):
+        return None, 0
+    g = (m.get("variantes") or {}).get(variante(item.get("titulo"), item.get("atributos"))) or m
+    return g["mediana"], g["n"]
 
 
 # ── CLASSIFICADOR (aprende com o 👍/👎 do usuário) ─────────
@@ -592,6 +661,13 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
             return excluido(titulo, f"Critério do usuário: '{frase}'")
 
     score, pros, contras, obs, motivos = 6, [], [], [], []
+    # "Troco rtx 5060 por rx 9060xt": quem anuncia quer OUTRA coisa, não dinheiro.
+    # "Vendo ou troco"/"aceito troca" é venda.
+    so_troca = bool(re.match(r"\W*(troco|troca|permuto|permuta)\b", norm(titulo))) and not any(
+        afirmado(texto, k) for k in ("vendo", "venda", "vender", "vende-se", "vende se"))
+    if so_troca:
+        contras.append("anúncio de TROCA: não fala em venda — pergunte se vende")
+        motivos.append("só troca")
     condicao = item.get("condicao") or "funcionando"
     # termo/preferências pedindo defeito ("rtx 3090 com defeito") valem como modo defeito
     if condicao == "funcionando" and any(_pede(procurado, ch) for ch, _, g in PROBLEMAS if g >= 2):
@@ -670,9 +746,45 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
     preco = item.get("preco") or 0
     teto = item.get("preco_max") or 0
     ref, n = referencia_preco(item, comparaveis)
-    pct, avp, forte = None, "sem_base", False
+    pct, avp, forte, suspeita = None, "sem_base", False, False
     barato_ok = condicao == "defeito" or bool(graves)     # quebrado barato é coerente
-    if teto and preco > 0:
+    ref_m, n_m = referencia_mercado(item) if condicao != "defeito" else (None, 0)
+    vs_mercado = bool(teto and 0 < preco <= teto and ref_m)
+    if vs_mercado:
+        # dentro do teto, com a mediana do MERCADO (sem o teto): a nota mede a pechincha
+        ref, n, pct = ref_m, n_m, round((preco - ref_m) / ref_m * 100)
+        metade = pct < MERCADO_SUSPEITO and not barato_ok
+        if metade and preco < 0.45 * teto:
+            # metade do mercado E abaixo de 45% do teto (a regra de sempre): sem alerta
+            score, avp = score - 2, "suspeito"
+            obs.append(f"Preço {-pct}% abaixo do mercado ({_brl(ref_m)}) — confira se não é golpe ou outro produto")
+            motivos.append("preço suspeito")
+        elif pct <= MERCADO_PECHINCHA:
+            forte = pct <= -30
+            score, avp = score + (3 if forte else 2), "bom"
+            motivos.append(f"pechincha: {-pct}% abaixo do mercado")
+            if pct <= -40:            # perto do que golpe costuma pedir
+                # barato demais + sinal (contato fora da OLX, pressa, descrição curta) =
+                # PECHINCHA SUSPEITA. Metade do mercado mas dentro do teto também é ⚠️:
+                # o usuário aceita esse preço, então avisa — com a ressalva
+                sinais = [r for r, ok in (
+                    ("contato fora da OLX", bool(_RE_CONTATO.search(texto))),
+                    ("pressa p/ vender", any(afirmado(texto, k) for k in _PRESSA)),
+                    ("descrição curta", sem_desc or len(desc) < 80)) if ok]
+                suspeita = metade or bool(sinais)
+                obs.append(f"{-pct}% abaixo do mercado" + (
+                    f" e {', '.join(sinais)}: padrão comum de golpe" if sinais
+                    else ": menos da metade do mercado é o padrão comum de golpe" if metade
+                    else ": ótimo se for real")
+                    + " — veja pessoalmente ou use a garantia da OLX, nunca pague adiantado")
+        elif pct <= 15:
+            avp = "justo"
+            obs.append(f"Cabe no seu teto, mas é o preço normal do mercado ({_brl(ref_m)}): não é pechincha")
+            motivos.append(f"preço de mercado ({pct:+d}%)")
+        else:
+            score, avp = score - 1, "caro"
+            motivos.append(f"{pct}% acima do mercado")
+    elif teto and preco > 0:
         # busca COM teto: o teto é a referência do próprio usuário. A mediana aqui
         # seria enviesada (só se coleta o que está abaixo do teto) e quase sempre
         # sem os 5 comparáveis -> nada viraria COMPRAR
@@ -741,6 +853,10 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
         score = min(score, 4)        # golpe, ou acima do teto com preço fixo
     elif teto and avp == "caro":
         score = min(score, 6)        # pouco acima do teto, sem preço fixo: VER, sem alerta
+    if so_troca:
+        score = min(score, 6)        # VER, sem alerta: aparece no /top p/ perguntar se vende
+    if suspeita:
+        score, avp = min(score, 7), "suspeito"   # alerta, mas como ⚠️, nunca 🟢
     score = max(1, min(10, score))
     rec = "COMPRAR" if score >= 8 else "VER" if score >= 5 else "IGNORAR"
     # COMPRAR = produto certo + sem problema relevante + preço COMPROVADAMENTE bom
@@ -749,10 +865,13 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
     # VALE NEGOCIAR = o preço compensa uma ressalva (problema moderado, detalhes,
     # sem descrição, pede um pouco acima do teto mas aceita proposta). Grave e
     # golpe nunca alertam
-    alerta = ("comprar" if rec == "COMPRAR"
-              else "negociar" if rec == "VER" and avp in ("bom", "negociavel") and gmax < 3 and not golpe
+    alerta = ("suspeita" if suspeita and not golpe and gmax < 3 and not so_troca
+              else "comprar" if rec == "COMPRAR"
+              else "negociar" if rec == "VER" and avp in ("bom", "negociavel") and gmax < 3
+              and not golpe and not so_troca
               else "")
-    base = (f" ({pct:+d}% vs seu teto)" if teto and pct is not None
+    base = (f" ({pct:+d}% vs mercado {_brl(ref)} de {n} anúncios)" if vs_mercado
+            else f" ({pct:+d}% vs seu teto)" if teto and pct is not None
             else f" ({pct:+d}% vs mediana {_brl(ref)} de {n} anúncios)" if pct is not None
             else f" (sem base de preço: {-n} anúncios com preços variados demais)" if n < 0
             else f" (sem base de preço: {n} comparáveis)")
@@ -760,11 +879,29 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
         decisao="APROVADO", resumo=f"{titulo[:80]} — {_brl(preco)}{base}",
         pros=pros, contras=contras, observacoes=obs, score=score,
         preco_vs_mercado_pct=pct, avaliacao_preco=avp, recomendacao=rec, alerta=alerta,
+        referencia="mercado" if vs_mercado else "teto" if teto and pct is not None else "",
         motivo="; ".join(motivos) or "produto confere, sem sinais relevantes",
     ).model_dump()
 
 
 # ── FILA ──────────────────────────────────────────────────
+
+def republicacao(item: dict) -> int | None:
+    """Id do anúncio já alertado de que este é cópia: mesmo local, preço igual ou
+    maior e título quase igual (80% das palavras). Vendedor apaga e posta de novo p/
+    subir na lista (sem isto, o mesmo anúncio repostado 3x em 1 h = 3 alertas).
+    Título curto ("RTX 5060") não identifica vendedor: fica de fora."""
+    palavras = lambda t: set(re.findall(r"[a-z0-9]+", norm(t)))
+    alvo = palavras(item.get("titulo"))
+    for c in db.alertados_mesmo_local(item["busca_id"], item["anuncio_id"],
+                                      item.get("local"), item.get("preco")):
+        outro = palavras(c["titulo"])
+        # nas últimas 24 h, o mesmo bairro e preço já basta: o vendedor pode
+        # trocar o título ("Placa de Vídeo 5060" -> "RTX 5060 8GB")
+        if c["recente"] or (len(alvo) >= 4 and len(alvo & outro) >= 0.8 * len(alvo | outro)):
+            return c["id"]
+    return None
+
 
 ultimo_processamento: str | None = None
 # ponytail: teto fixo por busca e passada; o 1º scan de uma busca ampla (ou um
@@ -825,7 +962,11 @@ async def processar_fila(notifier=None):
 
         for item, av in sorted(alertas, key=lambda x: -x[1]["score"]):     # os melhores primeiro
             r = por_busca[item["busca_id"]]
-            if r["alertas"] >= MAX_ALERTAS:
+            if (orig := republicacao(item)):         # o usuário já recebeu este anúncio
+                db.marcar_notificado(item["anuncio_id"])
+                logger.info(f"sem alerta: republicação do anúncio {orig} — "
+                            f"{(item.get('titulo') or '')[:50]}")
+            elif r["alertas"] >= MAX_ALERTAS:
                 r["sem_alerta"] += 1
             elif await notifier.enviar_resultado(item, av):
                 r["alertas"] += 1

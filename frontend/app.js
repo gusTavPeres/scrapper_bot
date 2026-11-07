@@ -271,6 +271,7 @@ function renderCard(a) {
     </div>
     ${a.motivo ? `<div class="anuncio-resumo">${esc(a.motivo)}</div>` : ''}
     ${a.alerta === 'negociar' ? '<div class="anuncio-rec rec-negociar">VALE NEGOCIAR</div>'
+      : a.alerta === 'suspeita' ? '<div class="anuncio-rec rec-negociar">PECHINCHA SUSPEITA</div>'
       : rec ? `<div class="anuncio-rec rec-${rec.toLowerCase()}">${rec}</div>` : ''}
   </div>`;
 }
@@ -301,7 +302,7 @@ function verDetalhe(anuncioId) {
       <div class="detalhe-preco-row">
         <div class="detalhe-preco-val">${brl(item.preco)}</div>
         ${pctHtml}
-        <span class="badge badge-${esc(rec || 'pendente')}" style="margin-left:auto">${item.alerta === 'negociar' ? 'VALE NEGOCIAR' : esc(item.recomendacao || 'SEM ANÁLISE')}</span>
+        <span class="badge badge-${esc(rec || 'pendente')}" style="margin-left:auto">${item.alerta === 'negociar' ? 'VALE NEGOCIAR' : item.alerta === 'suspeita' ? 'PECHINCHA SUSPEITA' : esc(item.recomendacao || 'SEM ANÁLISE')}</span>
         ${item.score ? `<span class="mono" style="font-size:20px;font-weight:700">${Number(item.score)}/10</span>` : ''}
       </div>
       <div>
