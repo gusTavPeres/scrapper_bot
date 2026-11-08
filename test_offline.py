@@ -15,6 +15,12 @@ import avaliador
 import notifier
 import scheduler
 import telegram_bot as tb
+import types
+# o laço do Telegram usa uma sessão: nos testes ela repassa p/ tb.requests.get/post,
+# que cada teste troca por um falso (nunca rede real)
+_SESSAO_TG_REAL = tb._sessao_tg
+tb._sessao_tg = lambda: types.SimpleNamespace(get=lambda *a, **k: tb.requests.get(*a, **k),
+                                              post=lambda *a, **k: tb.requests.post(*a, **k))
 from avaliador import produto_bate, avaliar, regras_do_texto, afirmado, norm
 
 _tmp = tempfile.TemporaryDirectory()
@@ -55,10 +61,11 @@ def anuncio_olx(lid, titulo, preco, **kw):
             "properties": [{"name": "category", "label": "Categoria", "value": "X"}], **kw}
 
 
-def pagina_olx(ads=None, flight=True):
+def pagina_olx(ads=None, flight=True, total=None):
     if not flight:
         return "<html><body>layout novo</body></html>"
-    corpo = {"pad": "x" * 1200} | ({"ads": ads} if ads is not None else {})
+    corpo = {"pad": "x" * 1200} | ({"ads": ads} if ads is not None else {}) \
+        | ({"totalOfAds": total, "pageSize": 50} if total is not None else {})
     return (f'<html><script>self.__next_f.push([0])</script>'
             f'<script>self.__next_f.push([1,{json.dumps(json.dumps(corpo))}])</script></html>')
 
@@ -137,7 +144,9 @@ def test_p1_flight_dos_scripts():
     ads = scheduler.extrair_anuncios(html)
     assert len(ads) == 1 and ads[0]["list_id"] == 1546193183
     assert scheduler.extrair_anuncios(pagina_olx(flight=False)) is None     # layout mudou
-    assert scheduler.extrair_anuncios(pagina_olx(None)) == []               # busca vazia
+    assert scheduler.extrair_anuncios(pagina_olx([], total=0)) == []        # busca vazia (como a OLX manda)
+    assert scheduler.extrair_anuncios(pagina_olx(None, total=0)) == []      # sem a lista, mas total 0
+    assert scheduler.extrair_anuncios(pagina_olx(None)) is None             # sem lista nem total: formato novo
     assert scheduler._texto_flight(['self.__next_f.push([1,"!quebrado']) == ""
 
 
@@ -2281,6 +2290,101 @@ def test_p11_polling_solta_ciclo_da_excecao():
     assert len(vivos) == 7 and max(vivos) <= 2, vivos      # sem o collect: 0,1,2,...,6
 
 
+def test_p11_polling_reaproveita_conexao():
+    """Uma sessão (conexão TLS) p/ o laço inteiro do Telegram: uma nova a cada
+    poll custava ~6 ms de CPU (contexto TLS + certificados), ~1.600x/dia."""
+    assert isinstance(_SESSAO_TG_REAL(), tb.requests.Session)      # criar não conecta
+    criadas, polls = [], [0]
+    class Resp:
+        ok, status_code, text = True, 200, ""
+        def json(self):
+            return {"result": []}
+    def get(*a, **k):
+        polls[0] += 1
+        if polls[0] > 3:
+            raise asyncio.CancelledError
+        return Resp()
+    fabrica = tb._sessao_tg
+    tb._sessao_tg = lambda: criadas.append(1) or types.SimpleNamespace(get=get, post=lambda *a, **k: Resp())
+    orig = (tb.TOKEN, tb.CHAT_ID)
+    tb.TOKEN, tb.CHAT_ID = "T", "42"
+    try:
+        try:
+            rodar(tb.loop_comandos())
+        except asyncio.CancelledError:
+            pass
+    finally:
+        tb._sessao_tg = fabrica
+        tb.TOKEN, tb.CHAT_ID = orig
+    assert polls[0] == 4 and criadas == [1], (polls, criadas)
+
+
+def test_p11_confere_total_declarado_pela_olx():
+    """Defeito silencioso: a OLX renomeia um campo e o bot passa a ler 20 de 50
+    sem erro nenhum (já aconteceu: meses lendo 5 de 50). A página declara o
+    total (totalOfAds/pageSize): leu bem menos que o declarado = alerta."""
+    bons = [anuncio_olx(7000 + i, f"RTX 3090 {i}", 5000) for i in range(20)]
+    renomeados = [{k if k != "subject" else "title": v for k, v in anuncio_olx(8000 + i, f"RTX 3090 r{i}", 5000).items()}
+                  for i in range(30)]
+    alertas, orig = [], notifier.alertar
+    notifier.alertar = lambda chave, texto, horas=12: alertas.append((chave, texto)) or True
+    olx = OlxFalsa({"o=1&": (200, pagina_olx(bons + renomeados, total=50)),
+                    "o=2&": (200, pagina_olx(bons[:10], total=60))})          # pág 2 de 60: 10 é o certo
+    try:
+        p1 = rodar(scheduler._pagina_de_busca(olx, "https://www.olx.com.br/brasil?q=x&o=1&sf=1"))
+        p2 = rodar(scheduler._pagina_de_busca(olx, "https://www.olx.com.br/brasil?q=x&o=2&sf=1"))
+    finally:
+        notifier.alertar = orig
+    assert len(p1) == 20 and len(p2) == 10, (len(p1), len(p2))      # o que deu p/ ler segue
+    assert [c for c, _ in alertas] == ["olx_formato"] and "declarou 50" in alertas[0][1], alertas
+    assert scheduler._faltando('"totalOfAds":3,"pageSize":50', 0, "u?o=1") is None   # poucos: não alarma
+    assert scheduler._faltando('"ads":[]', 0, "u?o=1") is None                       # sem total: não dá p/ saber
+
+
+def test_p11_checagem_diaria_da_olx():
+    """1x/dia numa busca ampla: anúncios completos, por data, com descrição.
+    Preço que some, ordem que muda e descrição vazia falhavam em silêncio."""
+    boa = [anuncio_olx(9000 + i, f"Geladeira {i}", 1000 + i, date=1792716949 - 60 * i) for i in range(45)]
+    alertas, orig = [], notifier.alertar
+    notifier.alertar = lambda chave, texto, horas=12: alertas.append((chave, texto)) or True
+    def roda(pagina, anuncio=pagina_anuncio("Geladeira frost free, funcionando, 2 anos de uso."), status=200):
+        alertas.clear()
+        scheduler._sessao = OlxFalsa({"q=geladeira": (status, pagina), "anuncio-": (200, anuncio)})
+        rodar(scheduler._canario())
+        return scheduler._canario_proximo - time.monotonic()
+    try:
+        assert roda(pagina_olx(boa)) > 80000 and alertas == [], alertas           # ok: próxima em 24 h
+        sem_preco = [{**a, "priceValue": ""} for a in boa]
+        roda(pagina_olx(sem_preco))
+        assert len(alertas) == 1 and "preço faltando" in alertas[0][1], alertas
+        roda(pagina_olx(boa[::-1]))                                               # mais velhos primeiro
+        assert "ordem de data" in alertas[0][1], alertas
+        roda(pagina_olx(boa), anuncio="<html>sem json-ld</html>")
+        assert "descrição" in alertas[0][1], alertas
+        roda(pagina_olx(boa[:10]))
+        assert "só 10 anúncios" in alertas[0][1], alertas
+        assert roda(pagina_olx(boa), status=403) < 4000 and alertas == []          # bloqueio: 1 h, sem alarme
+    finally:
+        notifier.alertar = orig
+    # o ciclo só chama quando venceu e fora da pausa por bloqueio
+    novo_banco()
+    chamou, orig_c = [], scheduler._canario
+    async def falso():
+        chamou.append(1)
+    scheduler._canario = falso
+    try:
+        scheduler._canario_proximo = time.monotonic() + 100
+        rodar(scheduler.ciclo())
+        scheduler._canario_proximo, scheduler._olx_pausa_ate = time.monotonic() - 1, time.monotonic() + 100
+        rodar(scheduler.ciclo())
+        assert chamou == []
+        scheduler._olx_pausa_ate = 0.0
+        rodar(scheduler.ciclo())
+        assert chamou == [1]
+    finally:
+        scheduler._canario = orig_c
+
+
 def test_p11_pausa_apos_bloqueio():
     """403/429: TODAS as buscas esperam 15 min (senão cada uma bate no bloqueio
     por conta própria). Layout mudado não pausa."""
@@ -2333,7 +2437,7 @@ if __name__ == "__main__":
             continue
         estado = [(m, k, getattr(m, k)) for m, ks in (
             (scheduler, ("raspar_busca", "_preencher_descricoes", "_sessao", "processar_busca",
-                        "_olx_falha_desde", "_olx_alertado", "_olx_pausa_ate")),
+                        "_olx_falha_desde", "_olx_alertado", "_olx_pausa_ate", "_canario_proximo")),
             (notifier, ("alertar", "enviar_queda", "_post", "_enviar", "TOKEN")),
             (tb, ("_enviar", "_post", "TOKEN", "CHAT_ID"))) for k in ks]
         try:

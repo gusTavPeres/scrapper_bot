@@ -310,6 +310,12 @@ def tratar_comando(texto: str) -> str:
     return "Comando desconhecido — /help"
 
 
+def _sessao_tg() -> requests.Session:
+    """Conexão TLS reaproveitada no long-poll: uma nova a cada poll (~1.600/dia)
+    custava ~6 ms de CPU (contexto TLS + certificados); reaproveitada, <1 ms."""
+    return requests.Session()
+
+
 async def loop_comandos():
     """Long-polling do getUpdates; responde só ao CHAT_ID configurado."""
     if not TOKEN:
@@ -319,8 +325,9 @@ async def loop_comandos():
         logger.warning("telegram: sem TELEGRAM_CHAT_ID — mande qualquer mensagem ao bot "
                        "que ele responde com o seu chat id")
     api = f"https://api.telegram.org/bot{TOKEN}"
+    http = _sessao_tg()
     try:   # menu nativo: digitar "/" no chat mostra os comandos com descrição
-        await asyncio.to_thread(requests.post, f"{api}/setMyCommands", json={"commands": [
+        await asyncio.to_thread(http.post, f"{api}/setMyCommands", json={"commands": [
             {"command": "add", "description": "nova busca — envie vazio p/ ver as opções"},
             {"command": "addcarro", "description": "busca de carros (ano= km= motor=); sem modelo = todos"},
             {"command": "buscas", "description": "listar buscas e contadores"},
@@ -340,7 +347,7 @@ async def loop_comandos():
     while True:
         try:
             r = await asyncio.to_thread(
-                requests.get, f"{api}/getUpdates",
+                http.get, f"{api}/getUpdates",
                 params={"timeout": 50, "offset": offset}, timeout=60)
             for up in r.json().get("result", []):
                 offset = up["update_id"] + 1
@@ -356,7 +363,7 @@ async def loop_comandos():
                             "chat_id": CHAT_ID, "message_id": cq["message"]["message_id"],
                             "reply_markup": botoes}))
                     for metodo, corpo in chamadas:
-                        rr = await asyncio.to_thread(requests.post, f"{api}/{metodo}",
+                        rr = await asyncio.to_thread(http.post, f"{api}/{metodo}",
                                                      json=corpo, timeout=10)
                         if not rr.ok:
                             logger.warning(f"telegram {metodo}: {rr.status_code} {rr.text[:150]}")

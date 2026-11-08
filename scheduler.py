@@ -190,7 +190,9 @@ def _anuncios_do_flight(texto: str) -> list[dict] | None:
     if len(texto) < 1000:
         return None
     if '"ads"' not in texto:
-        return []
+        # busca vazia vem com "ads":[] e totalOfAds 0; sem a lista E sem o total
+        # zerado = formato novo. Tratar como "vazia" deixaria o bot cego em silêncio
+        return [] if re.search(r'"totalOfAds"\s*:\s*0\b', texto) else None
     produtos = []
     for ad in _achar_array_json(texto, '"ads"') or []:
         try:
@@ -236,14 +238,36 @@ async def _baixar(sessao, url: str, **kw):
     return r
 
 
+def _faltando(texto: str, lidos: int, url: str) -> str | None:
+    """A OLX declara o total da busca (totalOfAds/pageSize): página que deveria
+    trazer N anúncios e rendeu bem menos = campo renomeado ou formato novo. É o
+    defeito silencioso: o bot já passou meses lendo 5 de 50 sem nenhum erro."""
+    total, tam = re.search(r'"totalOfAds"\s*:\s*(\d+)', texto), re.search(r'"pageSize"\s*:\s*(\d+)', texto)
+    if not (total and tam):
+        return None
+    pagina = int(m.group(1)) if (m := re.search(r"[?&]o=(\d+)", url)) else 1
+    esperado = max(0, min(int(tam.group(1)), int(total.group(1)) - (pagina - 1) * int(tam.group(1))))
+    if esperado >= 5 and lidos < 0.8 * esperado:
+        return f"a OLX declarou {esperado} anúncios na página e o bot leu só {lidos}"
+    return None
+
+
 async def _pagina_de_busca(sessao, url: str) -> list[dict] | None:
-    """Payload RSC (3,4x menor) e, se não vier no formato esperado, o HTML."""
+    """Payload RSC (3,4x menor) e, se não vier no formato esperado, o HTML.
+    Confere o lido com o total que a própria OLX declara."""
     r = await _baixar(sessao, url, headers={"RSC": "1"})
-    if "x-component" in (r.headers.get("content-type") or ""):
-        ads = _anuncios_do_flight(r.text)
-        if ads is not None:
-            return ads
-    return extrair_anuncios((await _baixar(sessao, url)).text)
+    texto = r.text if "x-component" in (r.headers.get("content-type") or "") else ""
+    ads = _anuncios_do_flight(texto) if texto else None
+    if ads is None:
+        html_ = (await _baixar(sessao, url)).text
+        texto = _texto_flight([s for s in _RE_SCRIPT.findall(html_) if "__next_f" in s])
+        ads = _anuncios_do_flight(texto)
+    if ads is not None and (falta := _faltando(texto, len(ads), url)):
+        logger.warning(f"formato da OLX: {falta} ({url})")
+        await asyncio.to_thread(notifier.alertar, "olx_formato",
+                                f"⚠️ A OLX pode ter mudado o formato: {falta}. Anúncios podem "
+                                "estar passando sem alerta — o bot precisa de ajuste.", 24)
+    return ads
 
 
 def _sessao():
@@ -545,6 +569,46 @@ def _detalhe_ram() -> str:
         return ""
 
 
+# Checagem diária da OLX numa busca ampla e estável: pega mudança de formato
+# mesmo com as buscas do usuário quietas (preço que some, descrição que sai
+# vazia, ordenação que muda — tudo isso falhava em silêncio). 2 requisições/dia
+CANARIO_URL = "https://www.olx.com.br/brasil?q=geladeira&o=1&sf=1"
+_canario_proximo = time.monotonic() + 3600        # 1ª: 1 h depois de subir
+
+
+async def _canario():
+    global _canario_proximo
+    _canario_proximo = time.monotonic() + 86400
+    try:
+        async with _sessao() as sessao:
+            ads = await _pagina_de_busca(sessao, CANARIO_URL) or []
+            problemas = [f"só {len(ads)} anúncios numa busca que traz ~50"] if len(ads) < 40 else []
+            for campo, ok in (("preço", lambda a: a["preco"] > 0), ("id", lambda a: a["list_id"]),
+                              ("data", lambda a: a["data_postagem"]), ("local", lambda a: a["local"]),
+                              ("foto", lambda a: a["imagem"])):
+                if ads and sum(1 for a in ads if ok(a)) < 0.8 * len(ads):
+                    problemas.append(f"{campo} faltando na maioria")
+            datas = [a["data_postagem"] for a in ads if a["data_postagem"]]
+            if datas and sum(x < y for x, y in zip(datas, datas[1:])) > 0.2 * len(datas):
+                problemas.append("não vem mais em ordem de data (o monitor perderia os novos)")
+            if ads:
+                await asyncio.sleep(1.5)
+                if len(extrair_descricao((await _baixar(sessao, ads[0]["url"])).text)) < 10:
+                    problemas.append("a descrição do anúncio não sai mais")
+    except Exception as e:             # bloqueio/rede: não é formato; tenta em 1 h
+        _canario_proximo = time.monotonic() + 3600
+        (logger.info if isinstance(e, OlxIndisponivel) else logger.warning)(
+            f"checagem diária da OLX adiada 1 h: {e!r}")
+        return
+    if problemas:
+        logger.warning("checagem diária da OLX: " + "; ".join(problemas))
+        await asyncio.to_thread(notifier.alertar, "olx_canario",
+                                "⚠️ Checagem diária da OLX falhou: " + "; ".join(problemas)
+                                + ". O bot precisa de ajuste.", 24)
+    else:
+        logger.info(f"checagem diária da OLX ok: {len(ads)} anúncios completos, por data, com descrição")
+
+
 async def ciclo(timeout_busca: float = 900):
     """Uma volta: buscas vencidas, depois a fila de avaliação."""
     global ultimo_ciclo
@@ -562,6 +626,8 @@ async def ciclo(timeout_busca: float = 900):
             logger.error(f"[{busca['nome']}] estourou {timeout_busca:.0f} s — "
                          "próxima tentativa no intervalo")
             db.registrar_erro(busca["id"], busca["intervalo_min"])
+    if time.monotonic() >= max(_canario_proximo, _olx_pausa_ate):
+        await _canario()
     await avaliador.processar_fila(notifier)
     db.manutencao_diaria()
     if buscas:

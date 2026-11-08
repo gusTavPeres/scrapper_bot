@@ -26,6 +26,10 @@ navegador) e avisa no Telegram quando aparece uma oportunidade.
   descrição, e no máximo 5 por busca a cada rodada (o resto fica no `/top`).
   Anúncio republicado pelo vendedor não repete o alerta; anúncio só de troca
   não alerta. Bloqueio da OLX só vira aviso depois de 1 h sem conseguir ler.
+- **Mudança de formato da OLX não passa em silêncio:** cada página é conferida
+  com o total de anúncios que a própria OLX declara, e 1x/dia uma busca ampla
+  confere preço, data, foto, ordem por data e descrição. Se algo quebrar, o
+  aviso chega no Telegram.
 - **Qualquer categoria e estado:** a busca da OLX alcança tudo (eletrônicos,
   carros, motos, imóveis, barcos...). Termo amplo mistura categorias ("civic" traz
   carros e peças): o resumo do 1º scan lista as categorias e o `/categorias`
@@ -79,6 +83,6 @@ para aceitar só conexões da própria máquina). Segredos ficam só no `.env`
 ## Testes
 
 ```bash
-./venv/bin/python test_offline.py      # 77 testes de regressão (não usam rede nem o banco real)
+./venv/bin/python test_offline.py      # 80 testes de regressão (não usam rede nem o banco real)
 ./venv/bin/python test_live_olx.py     # canário contra a OLX real (layout, RSC, ordem)
 ```
