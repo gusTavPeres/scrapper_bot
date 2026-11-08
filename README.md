@@ -24,8 +24,10 @@ navegador) e avisa no Telegram quando aparece uma oportunidade.
   e 💸 queda de preço /
   entrou no teto. Só depois de ler a
   descrição, e no máximo 5 por busca a cada rodada (o resto fica no `/top`).
-  Anúncio republicado pelo vendedor não repete o alerta; anúncio só de troca
-  não alerta. Bloqueio da OLX só vira aviso depois de 1 h sem conseguir ler.
+  Anúncio republicado pelo vendedor não repete o alerta (parecido demais para
+  ter certeza vem com o aviso); anúncio só de troca não alerta. Bloqueio da OLX
+  só vira aviso depois de 1 h sem conseguir ler; Telegram fora do ar não perde
+  alerta (sai quando ele volta).
 - **Mudança de formato da OLX não passa em silêncio:** cada página é conferida
   com o total de anúncios que a própria OLX declara, e 1x/dia uma busca ampla
   confere preço, data, foto, ordem por data e descrição. Se algo quebrar, o
@@ -83,6 +85,6 @@ para aceitar só conexões da própria máquina). Segredos ficam só no `.env`
 ## Testes
 
 ```bash
-./venv/bin/python test_offline.py      # 80 testes de regressão (não usam rede nem o banco real)
+./venv/bin/python test_offline.py      # 89 testes de regressão (não usam rede nem o banco real)
 ./venv/bin/python test_live_olx.py     # canário contra a OLX real (layout, RSC, ordem)
 ```

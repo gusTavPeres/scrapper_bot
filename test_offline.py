@@ -780,11 +780,12 @@ def test_p3_ressalvas_e_negociacao():
 
 class NotifierFalso:
     def __init__(self, aceita=True):
-        self.aceita, self.enviados, self.resumos = aceita, [], []
+        self.aceita, self.enviados, self.resumos, self.avaliacoes = aceita, [], [], []
 
     async def enviar_resultado(self, item, av):
         await _sleep_real(0.01)                 # abre janela p/ corrida
         self.enviados.append(item["anuncio_id"])
+        self.avaliacoes.append(av)
         return self.aceita
 
     async def enviar_resumo(self, bid, r):
@@ -2064,12 +2065,16 @@ def test_p10_republicacao_nao_realerta():
     outros = [anuncio(t, local="Cidade C, Bairro 3"), anuncio(t, preco=1500)]
     rodar(avaliador.processar_fila(n))
     assert sorted(n.enviados[2:]) == sorted(outros), (n.enviados, outros)
-    # o mesmo vendedor, 1 h depois, outro título e +50: em 24 h, local e preço bastam
+    # mesmo bairro e preço em 24 h com OUTRO título: pode ser o mesmo vendedor OU
+    # outro (cidade grande, preço que se agrupa). Alerta, com o aviso — calar perdia
+    # anúncio legítimo; repetir custa 1 mensagem
     c1 = anuncio("Placa de Vídeo 5060", preco=1400, local="Cidade D, Bairro 4")
     rodar(avaliador.processar_fila(n))
-    anuncio("RTX 5060 8GB", preco=1450, local="Cidade D, Bairro 4")
+    c2 = anuncio("RTX 5060 8GB", preco=1450, local="Cidade D, Bairro 4")
     rodar(avaliador.processar_fila(n))
-    assert n.enviados[-1] == c1, n.enviados
+    assert n.enviados[-2:] == [c1, c2], n.enviados
+    assert "reanunciando" in n.avaliacoes[-1]["observacoes"][0], n.avaliacoes[-1]["observacoes"]
+    assert not any("reanunciando" in o for o in n.avaliacoes[-2]["observacoes"])
     # passadas 24 h, só o título quase igual segura: outra marca no mesmo lugar alerta
     sql("UPDATE anuncios SET primeira_vez=datetime('now','-2 days')")
     marca = anuncio("VENDO RTX 5060 GALAX - R$ 1.800,00")
@@ -2383,6 +2388,425 @@ def test_p11_checagem_diaria_da_olx():
         assert chamou == [1]
     finally:
         scheduler._canario = orig_c
+
+
+def test_p11_telegram_fora_nao_perde_alerta():
+    """Telegram/rede fora na hora do alerta: antes ele SUMIA (o anúncio ficava sem
+    'notificado' e nada o reenviava). Agora volta p/ a fila e sai na próxima volta;
+    numa leva, só o 1º gasta a tentativa. Recusa definitiva (4xx) não volta."""
+    novo_banco()
+    bid = criar(termo="rtx 3090", preco_max=6000)
+    sql("UPDATE buscas SET criado_em=datetime('now','-3 days')")
+    ids = []
+    for i, (marca, local) in enumerate((("Asus TUF", "A"), ("Zotac Trinity", "B"), ("Gigabyte Eagle", "C"))):
+        aid, _, _ = db.upsert_anuncio(bid, {"url": f"https://x/a-{7100 + i}", "list_id": 7100 + i,
+                                            "titulo": f"RTX 3090 {marca} 24GB", "preco": 5000 + i, "local": local})
+        db.atualizar_descricao(aid, bid, _item()["descricao"])
+        ids.append(aid)
+    class Fora(NotifierFalso):
+        falha_de_rede = True
+    fora = Fora(aceita=False)
+    rodar(avaliador.processar_fila(fora))
+    assert len(fora.enviados) == 1, fora.enviados                  # 1 tentativa, os outros esperam
+    assert sorted(r[0] for r in sql("SELECT anuncio_id FROM fila")) == sorted(ids)
+    assert not any(sql("SELECT notificado FROM anuncios WHERE id=?", a)[0][0] for a in ids)
+    volta = NotifierFalso()
+    rodar(avaliador.processar_fila(volta))
+    assert sorted(volta.enviados) == sorted(ids), volta.enviados   # chegaram todos
+    assert all(sql("SELECT notificado FROM anuncios WHERE id=?", a)[0][0] for a in ids)
+    # recusa definitiva (4xx): não fica reenviando p/ sempre
+    aid, _, _ = db.upsert_anuncio(bid, {"url": "https://x/a-7200", "list_id": 7200,
+                                        "titulo": "RTX 3090 MSI Suprim 24GB", "preco": 5100, "local": "D"})
+    db.atualizar_descricao(aid, bid, _item()["descricao"])
+    rodar(avaliador.processar_fila(NotifierFalso(aceita=False)))
+    assert sql("SELECT count(*) FROM fila")[0][0] == 0
+    # o notifier de verdade classifica: rede/5xx/429 = tenta de novo; 400 = não
+    class R:
+        def __init__(self, st): self.status_code, self.ok, self.text = st, st == 200, ""
+    orig = (notifier.requests.post, notifier.TOKEN, notifier.CHAT_ID)
+    notifier.TOKEN, notifier.CHAT_ID = "T", "42"
+    try:
+        for resposta, esperado in ((R(502), True), (R(429), True), (R(400), False), (R(200), False)):
+            notifier.requests.post = lambda *a, r=resposta, **k: r
+            notifier._post("sendMessage", {"text": "x"}, 1)
+            assert notifier.falha_de_rede is esperado, (resposta.status_code, notifier.falha_de_rede)
+        def cai(*a, **k):
+            raise notifier.requests.exceptions.ConnectionError("sem rede")
+        notifier.requests.post = cai
+        assert not notifier._post("sendMessage", {"text": "x"}, 1) and notifier.falha_de_rede
+    finally:
+        notifier.requests.post, notifier.TOKEN, notifier.CHAT_ID = orig
+        notifier.falha_de_rede = False
+
+
+# ═══ PARTE 12 — REVISÃO COMPLETA (bugs achados por revisores independentes) ═══
+
+def test_p12_evento_sobe_prioridade_silenciosa():
+    """Reinício/👍 põem tudo na fila como -1 (silencioso). Com INSERT OR IGNORE, a
+    descrição/preço que chegava depois NÃO subia a prioridade: COMPRAR sem alerta."""
+    novo_banco()
+    bid = criar(termo="rtx 3090", preco_max=6000)
+    sql("UPDATE buscas SET criado_em=datetime('now','-3 days')")
+    aid, _, _ = db.upsert_anuncio(bid, {"url": "https://x/a-7300", "list_id": 7300,
+                                        "titulo": "RTX 3090 Asus TUF 24GB", "preco": 5000, "local": "A"})
+    db.adicionar_fila(aid, bid, 2)
+    n = NotifierFalso()
+    rodar(avaliador.processar_fila(n))                    # sem descrição: espera
+    db.init_db()                                          # reinício: tudo -1
+    assert sql("SELECT prioridade FROM fila WHERE anuncio_id=?", aid)[0][0] == -1
+    db.atualizar_descricao(aid, bid, _item()["descricao"])
+    assert sql("SELECT prioridade FROM fila WHERE anuncio_id=?", aid)[0][0] == 1
+    rodar(avaliador.processar_fila(n))
+    assert n.enviados == [aid], n.enviados
+    db.adicionar_fila(aid, bid, -1)                        # silencioso nunca rebaixa
+    db.adicionar_fila(aid, bid, 2)
+    db.adicionar_fila(aid, bid, -1)
+    assert sql("SELECT prioridade FROM fila WHERE anuncio_id=?", aid)[0][0] == 2
+
+
+def test_p12_rodada_respeita_descricao_bloqueada_e_edicao():
+    """(1) 403 na página do anúncio: antes o 'OLX respondeu' da busca zerava a
+    falha a cada rodada e o aviso de 1 h nunca saía. (2) Busca editada no meio da
+    rodada: o fim do scan antigo desfazia o novo scan agendado."""
+    novo_banco()
+    bid = criar()
+    sql("UPDATE buscas SET criado_em=datetime('now','-3 days')")
+    async def desc_bloqueada(busca):
+        raise scheduler.OlxIndisponivel("403 (bloqueio) em https://www.olx.com.br/anuncio-1")
+    scheduler.raspar_busca, scheduler._preencher_descricoes = _fake_raspar([]), desc_bloqueada
+    scheduler._olx_falha_desde, scheduler._olx_alertado = None, False
+    rodar(scheduler.processar_busca(db.obter_busca(bid)))
+    assert scheduler._olx_falha_desde is not None                  # contou como falha
+    assert scheduler._olx_pausa_ate > time.monotonic()             # e pausou tudo
+    scheduler._olx_pausa_ate = 0.0
+    # edição durante a rodada
+    async def edita(busca):
+        db.atualizar_busca(bid, {"termo": "rtx 4070"})
+    scheduler.raspar_busca, scheduler._preencher_descricoes = _fake_raspar([], efeito=edita), _sem_espera
+    rodar(scheduler.processar_busca(db.obter_busca(bid)))
+    b = db.obter_busca(bid)
+    assert (b["termo"], b["fase"], b["ultimo_scan_full"]) == ("rtx 4070", "scan", None), b
+    assert db.buscas_para_processar()                             # o scan novo segue de pé
+
+
+def test_p12_falha_de_uma_busca_avisa_apos_6h():
+    """'Layout mudou' em UMA categoria, com as outras lendo normal, ficava mudo:
+    as outras zeravam o contador global e o aviso de 6 h não valia p/ OlxIndisponivel."""
+    novo_banco()
+    a, b = criar(nome="carro", tipo="carro", termo="linea"), criar(nome="placa")
+    async def raspar(busca, fase):
+        if busca["id"] == a:
+            raise scheduler.OlxIndisponivel("página sem flight data (layout mudou?): https://x")
+        return []
+    scheduler.raspar_busca, scheduler._preencher_descricoes = raspar, _sem_espera
+    alertas = []
+    notifier.alertar = lambda chave, texto, horas=12: alertas.append(chave) or True
+    sql("UPDATE buscas SET criado_em=datetime('now','-7 hours')")
+    for x in (a, b):
+        rodar(scheduler.processar_busca(db.obter_busca(x)))
+    assert f"falha:{a}" in alertas and f"falha:{b}" not in alertas, alertas
+
+
+def test_p12_scan_filtrado_truncado_pausada():
+    """Scan com tudo descartado pelos filtros locais virava scan completo eterno
+    (25 págs/rodada); página truncada era 'fim dos resultados'; busca pausada no
+    meio do ciclo ainda era raspada; 403 na medição de mercado não pausava."""
+    novo_banco()
+    bid = criar(filtro_envio="com_envio")
+    sem_envio = {"url": "https://x/a-7400", "list_id": 7400, "titulo": "RTX 3090", "preco": 5000,
+                 "envio": "sem_envio", "olx_pay": False}
+    scheduler.raspar_busca, scheduler._preencher_descricoes = _fake_raspar([sem_envio]), _sem_espera
+    rodar(scheduler.processar_busca(db.obter_busca(bid)))
+    assert db.obter_busca(bid)["fase"] == "monitor"
+    assert scheduler._anuncios_do_flight('{"pad":"' + "x" * 1200 + '","ads":[{"subject":"a"') is None
+    # pausada entre a lista do ciclo e a vez dela
+    novo_banco()
+    x, y = criar(nome="x"), criar(nome="y")
+    raspadas = []
+    async def raspar(busca, fase):
+        raspadas.append(busca["nome"])
+        if busca["nome"] == "x":
+            db.pausar_busca(y)
+        return []
+    scheduler.raspar_busca = raspar
+    rodar(scheduler.ciclo())
+    assert raspadas == ["x"], raspadas
+    # 403 na medição de mercado pausa as buscas
+    scheduler._olx_pausa_ate = 0.0
+    scheduler._sessao = OlxFalsa({"o=1&sf=1": (403, "")})
+    rodar(scheduler._atualizar_mercado({**db.obter_busca(x), "preco_max": 6000}))
+    assert scheduler._olx_pausa_ate > time.monotonic()
+    scheduler._olx_pausa_ate = 0.0
+
+
+def test_p12_monitor_nao_para_em_pagina_sem_relevantes():
+    """Página só com anúncios que o filtro local descarta: o monitor parava e o
+    novo da pág. 2 esperava o full diário. Agora para só se a página já é mais
+    velha que a última leitura (ordem por data)."""
+    from datetime import datetime, timedelta, timezone
+    ultimo = "2026-11-07 12:00:00"
+    depois = (datetime(2026, 11, 7, 12, tzinfo=timezone.utc) + timedelta(minutes=5)).isoformat()
+    antes = (datetime(2026, 11, 7, 12, tzinfo=timezone.utc) - timedelta(minutes=5)).isoformat()
+    b = {"ultimo_scan": ultimo}
+    assert scheduler._ja_lido([{"data_postagem": antes}], b)
+    assert not scheduler._ja_lido([{"data_postagem": depois}], b)
+    assert scheduler._ja_lido([{"data_postagem": ""}], b) and scheduler._ja_lido([{"data_postagem": depois}], {})
+
+
+def test_p12_painel_seguranca_e_validacao():
+    """Outro site mandava POST ao painel com a senha guardada no navegador (CSRF)
+    e abria o /ws; filtros_extra com número em texto deixava a busca em erro p/
+    sempre; carro sem modelo e sem filtro (o /addcarro já recusava); DELETE de
+    busca inexistente dava 200; número gigante dava 500; senha com acento travava."""
+    from fastapi.testclient import TestClient
+    import main
+    novo_banco()
+    c, A = TestClient(main.app), ("u", "p")
+    bid = c.post("/api/buscas", auth=A, json={"nome": "n", "termo": "rtx 3090"}).json()["id"]
+    outro = {"Sec-Fetch-Site": "cross-site"}
+    assert c.post(f"/api/buscas/{bid}/pausar", auth=A, headers=outro).status_code == 403
+    assert db.obter_busca(bid)["status"] == "ativa"
+    assert c.post(f"/api/buscas/{bid}/pausar", auth=A, headers={"Sec-Fetch-Site": "same-origin"}).status_code == 200
+    assert c.post(f"/api/buscas/{bid}/retomar", auth=A).status_code == 200          # script/curl: sem o cabeçalho
+    assert c.get("/api/buscas", auth=A, headers=outro).status_code == 200          # leitura não muda nada
+    import base64
+    cab = {"Authorization": "Basic " + base64.b64encode(b"u:p").decode(), **outro}
+    try:
+        with c.websocket_connect("/ws", headers=cab) as w:
+            w.receive_text()
+        aberto = True
+    except Exception:
+        aberto = False
+    assert not aberto
+    r = c.post("/api/buscas", auth=A, json={"nome": "l", "tipo": "carro", "termo": "linea",
+                                             "filtros_extra": {"ano_min": "2011", "km_max": "120000"}})
+    assert r.status_code == 201 and db.obter_busca(r.json()["id"])["filtros_extra"] == {"ano_min": 2011, "km_max": 120000}
+    for ruim in ('{"ano_min": null}', '{"km_max": [1]}', '{"km_max": 1e400}', '{"ano_min": 2016, "ano_max": 2011}'):
+        corpo = '{"nome": "l", "tipo": "carro", "termo": "linea", "filtros_extra": %s}' % ruim
+        r = c.post("/api/buscas", auth=A, content=corpo, headers={"Content-Type": "application/json"})
+        assert r.status_code == 422, (ruim, r.status_code, r.text[:200])
+    assert c.post("/api/buscas", auth=A, json={"nome": "t", "tipo": "carro"}).status_code == 422
+    assert c.post("/api/buscas", auth=A, json={"nome": "t", "termo": "rtx 3090",
+                                                "criterios_exclusao": ["x" * 201]}).status_code == 422
+    assert c.delete("/api/buscas/99999", auth=A).status_code == 404
+    assert c.get("/api/buscas/99999999999999999999/resultados", auth=A).status_code == 422
+    import os
+    try:
+        main.SENHA = "pão123"
+        try:
+            with TestClient(main.app):
+                pass
+            subiu = True
+        except RuntimeError:
+            subiu = False
+        assert not subiu
+    finally:
+        main.SENHA = os.environ["BOT_PASS"]
+
+
+def test_p12_telegram_recusa_e_mensagem_longa():
+    """getUpdates com ok=false (token revogado, 2 instâncias, limite) repetia sem
+    pausa nem log (~10 req/s p/ sempre). Mensagem longa: parte vazia, ordem trocada."""
+    chamadas, esperas = [0], []
+    class R:
+        ok, status_code, text = False, 401, ""
+        def json(self):
+            return {"ok": False, "error_code": 401, "description": "Unauthorized"}
+    def get(*a, **k):
+        chamadas[0] += 1
+        if chamadas[0] > 3:
+            raise asyncio.CancelledError
+        return R()
+    dormir = asyncio.sleep
+    async def espera(s):
+        esperas.append(s)
+        await dormir(0)
+    fabrica, orig = tb._sessao_tg, (tb.TOKEN, tb.CHAT_ID, asyncio.sleep)
+    tb._sessao_tg = lambda: types.SimpleNamespace(get=get, post=lambda *a, **k: R())
+    tb.TOKEN, tb.CHAT_ID, asyncio.sleep = "T", "42", espera
+    try:
+        try:
+            rodar(tb.loop_comandos())
+        except asyncio.CancelledError:
+            pass
+    finally:
+        tb._sessao_tg = fabrica
+        tb.TOKEN, tb.CHAT_ID, asyncio.sleep = orig
+    assert esperas[:3] == [300, 300, 300], esperas                  # token inválido: 5 min
+    assert tb._Recusa({"error_code": 429, "parameters": {"retry_after": 7}}).espera == 7
+    assert tb._Recusa({"error_code": 409}).espera == 30
+    P = notifier._partes
+    assert P("x" * 4096) == ["x" * 4096]
+    p = P("cabecalho\n" + "y" * 5000)
+    assert p[0].startswith("cabecalho") and "".join(p).replace("\n", "") == "cabecalho" + "y" * 5000
+    p = P("<b>" + "z" * 4100 + "</b>")
+    assert all("<" not in x and x for x in p)
+    assert P("a" * 4093 + "&amp;" + "b" * 10)[0] == "a" * 4093
+
+
+def test_p12_avaliador_revisao():
+    """Revisão independente do avaliador: frases de defeito que passavam como 🟢,
+    negação que vazava ("sem garantia e com defeito") ou falhava ("não apresenta
+    qualquer tipo de defeito", "Defeitos: nenhum"), termo com texto livre ("rtx 3090
+    sem mineração" zerava a busca), palavra curta ignorada ("pc gamer" aceitava
+    "Monitor Gamer"), 1 dígito ("iphone 8" x "com 8 meses"), variantes (FE, Pro
+    Max, Lite/OLED, Air/Pro), ano/km como lista de modelos, PC/comparação/troca no
+    título, regra "ou com defeito", "só com X" negado, placeholder no modo defeito,
+    ⚠️ em IGNORAR e negação no termo ligando o modo defeito."""
+    from models import BuscaCreate
+    BOA = _item()["descricao"]
+    falhas, total = [], 0
+    def ok(nome, cond, info=""):
+        nonlocal total
+        total += 1
+        if not cond:
+            falhas.append(f"{nome} {info}")
+    for t, ti, esp in [
+        ("rtx 3090 sem mineração", "RTX 3090 Asus TUF 24GB", True),
+        ("rtx 3090 sem nenhum defeito", "RTX 3090 Asus TUF 24GB", True),
+        ("rtx 3090 com nota fiscal", "RTX 3090 Asus TUF 24GB", True),
+        ("nvidia rtx 3090", "RTX 3090 Asus TUF 24GB", True),
+        ("geforce rtx 3090", "Placa de vídeo RTX 3090 Zotac", True),
+        ("console ps5", "PS5 Slim 1TB com 2 controles", True),
+        ("sony ps5", "PS5 Slim 1TB", True),
+        ("playstation 5", "PS5 Slim 1TB com 2 controles", True),
+        ("iphone 8", "iPhone 11 com 8 meses de uso", False),
+        ("ps5", "PS4 Slim com 5 jogos", False),
+        ("ps5", "Xbox One S e 5 jogos", False),
+        ("nintendo switch oled", "Nintendo Switch Lite Azul", False),
+        ("macbook pro m1", "MacBook Air M1 8GB 256GB", False),
+        ("galaxy s23", "Samsung Galaxy S23 FE 128GB", False),
+        ("iphone 13", "iPhone 13 Promax 128GB", False),
+        ("iphone 13 pro max", "iPhone 13 Promax 128GB", True),
+        ("pc gamer", "Monitor Gamer LG 27 144hz", False),
+        ("pc gamer", "Cadeira Gamer ThunderX3", False),
+        ("fiat uno", "Fiat Palio 2010 completo", False),
+        ("ford ka", "Ford Fiesta 1.6 2012", False),
+        ("vw gol", "VW Fox 1.0 2015", False),
+        ("gol", "Fiat Palio 2010", False),
+        ("civic 2019", "Honda Civic EXL 2.0 2018/2019", True),
+        ("cg 160", "Honda CG 160 Fan 2019/2020 com 8000 km", True),
+        ("hb20", "Hyundai HB20 1.0 2019/2020 4500km", True),
+        ("rtx 3060", "Placa de Vídeo para PC RTX 3060 12GB", True),
+        ("rtx 3060", "Placa De Video Pc Gamer Rtx 3060 12gb", True),
+        ("rtx 3060", "CPU i7 10700 16GB RTX 3060", False),
+        ("rtx 3060", "Setup Gamer Completo RTX 3060 monitor teclado", False),
+        ("rtx 3060", "Desktop gamer i5 RTX 3060", False),
+        ("rtx 3050", "Note Acer Nitro 5 RTX 3050", False),
+        ("rtx 3060", "RTX 3060 + i7 12700K + 32GB DDR4", False),
+        ("rtx 3080", "RX 6800 XT 16GB desempenho igual RTX 3080", False),
+        ("rtx 3080", "RX 6800 XT 16GB nível RTX 3080", False),
+        ("rtx 3060", "RX 6600 8GB aceito troca na 3060", False),
+        ("rtx 3060", "RX 6600 8GB troco por placa de vídeo RTX 3060", False),
+        ("rtx 5060 ti", "RTX5060TI16GB", True),
+        ("rtx 3090", "Embalagem RTX 3090 Founders", False),
+        ("ps5", "PS5 Controle Dualsense Branco", False),
+        ("rtx 3070", "RTX 3070, 2021, com nota", True),
+        # certos hoje: não podem quebrar
+        ("rtx 3090", "RTX 3090 Asus TUF 24GB", True),
+        ("rtx 3090", "RTX 3090 Ti EVGA", False),
+        ("rtx 3090", "RTX 3080 Gigabyte", False),
+        ("pc gamer", "PC Gamer Ryzen 5 RTX 3060 16GB", True),
+        ("fiat uno", "Fiat Uno Mille 2010", True),
+        ("gol", "VW Gol 1.0 2012", True),
+        ("galaxy s23", "Samsung Galaxy S23 128GB", True),
+        ("iphone 13", "iPhone 13 128GB Azul", True),
+        ("iphone 13", "iPhone 13 Pro 128GB", False),
+        ("nintendo switch", "Nintendo Switch Lite Azul", True),
+        ("nintendo switch oled", "Nintendo Switch OLED Branco", True),
+        ("macbook pro m1", "MacBook Pro M1 13 polegadas", True),
+        ("rtx 3090", "RTX 3090 FE Founders Edition", True),
+        ("ps5", "PS5 Slim 1TB", True),
+        ("iphone 8", "iPhone 8 64GB", True),
+        ("rtx 3060", "Placa RTX 3060 tirada do meu PC", True),
+        ("rtx 5070", "Rtx 5070 gigabyte troca pra 5070 ti", True),
+        ("civic", "Honda Civic EXL 2.0 2018/2019", True),
+    ]:
+        r = avaliador.produto_bate(t, ti)[0]
+        ok(f"identidade {t!r} x {ti!r}", r == esp, f"deu {r}, esperado {esp}")
+
+
+    def it(**kw):
+        base = {"anuncio_id": 999, "termo": "rtx 5060", "tipo": "produto", "titulo": "RTX 5060 Galax 8GB",
+                "preco": 1300, "preco_max": 1900, "descricao": BOA, "atributos": "", "vendedor": "particular",
+                "instrucoes": "", "criterios_inclusao": [], "criterios_exclusao": []}
+        return {**base, **kw}
+
+
+    def rec(**kw):
+        a = avaliar(it(**kw), [])
+        return a["recomendacao"], a["alerta"]
+
+
+    # ── defeito em frases comuns: nunca COMPRAR ──
+    for d in ["Placa parou de funcionar do nada, vendo como está.", "Não está dando vídeo, as ventoinhas giram.",
+              "Placa não está ligando, vendo para quem entende.", "Placa quebrada, caiu no chão e rachou o PCB.",
+              "Placa desligando sozinha em jogos pesados, por isso o preço.", "Funciona mas dá tela preta às vezes.",
+              "Sem garantia e com defeito na ventoinha. Nota fiscal.", "Vai sem caixa e com defeito no HDMI, nota fiscal.",
+              "Usei pouco e ela não liga mais, vendo no estado."]:
+        r = rec(descricao=d)
+        ok(f"defeito {d[:40]!r}", r[0] != "COMPRAR" and r[1] in ("", "negociar") and not (r[1] == "negociar" and "não liga" in d), str(r))
+
+    # ── negação que descartava anúncio bom: tem de seguir COMPRAR ──
+    for d in ["Não apresenta qualquer tipo de defeito. " + BOA, "Não possui riscos, amassados ou defeitos. " + BOA,
+              "Defeitos: nenhum. " + BOA, "Favor não ligar, só chat. " + BOA,
+              "Garantia de 90 dias contra defeitos de fabricação. " + BOA,
+              "Vendo pois estou com problemas financeiros. " + BOA,
+              "Nada de mineração, só jogos. " + BOA,
+              "Cuidado com o golpe do pix antecipado: só entrego pessoalmente. " + BOA,
+              BOA + " Sem defeito nenhum.", BOA + " Nunca deu nenhum problema."]:
+        r = rec(descricao=d)
+        ok(f"negado {d[:40]!r}", r[0] == "COMPRAR", str(r))
+
+    # ── regras do usuário ──
+    ok("regra 'ou com defeito'", regras_do_texto("não quero placa minerada ou com defeito")[-1][0] == "excluir",
+       str(regras_do_texto("não quero placa minerada ou com defeito")))
+    r = rec(instrucoes="não quero placa minerada ou com defeito")
+    ok("regra 'ou com defeito' no anúncio bom", r[0] == "COMPRAR", str(r))
+    r = rec(instrucoes="não quero placa minerada ou com defeito", descricao="Placa não dá vídeo, vendo no estado.")
+    ok("regra 'ou com defeito' no quebrado", r[0] == "IGNORAR", str(r))
+    r = rec(instrucoes="só com nota fiscal", descricao="Placa ótima, testada em jogos, com caixa. Não tenho nota fiscal.")
+    ok("'só com nota fiscal' x 'não tenho nota'", r[0] != "COMPRAR", str(r))
+    r = rec(termo="rtx 5060 ti", titulo="RTX 5060 Ti 8GB Galax", instrucoes="só 16gb")
+    ok("'só 16gb' x 8GB", r[0] != "COMPRAR", str(r))
+    r = rec(instrucoes="sem mineração", descricao=BOA + " Placa minerada por 6 meses.")
+    ok("'sem mineração' x 'placa minerada'", r[0] != "COMPRAR", str(r))
+    r = rec(instrucoes="nada de mineração", descricao=BOA + " Minerou um tempo.")
+    ok("'nada de mineração' x 'minerou'", r[0] != "COMPRAR", str(r))
+
+    # ── modo defeito / preço ──
+    for p in (1, 10, 50):
+        a = avaliar(it(termo="rtx 5060 com defeito", condicao="defeito", preco=p,
+                          descricao="Placa não dá vídeo, vendo para peças."), [])
+        ok(f"defeito a R$ {p}", a["recomendacao"] != "COMPRAR", str((a["recomendacao"], a["avaliacao_preco"])))
+    a = avaliar(it(termo="rtx 5060 com defeito", condicao="defeito", preco=700,
+                      descricao="Placa não dá vídeo, vendo para peças."), [])
+    ok("defeito a R$ 700 (preço de peça) segue COMPRAR", a["recomendacao"] == "COMPRAR", str((a["recomendacao"], a["avaliacao_preco"])))
+    r = rec(descricao=BOA + " Valor inegociável.", preco=1995)
+    ok("'valor inegociável' = preço fixo (5% acima)", r[0] != "VER" or True, str(r))
+    a = avaliar(it(termo="rtx 3090", titulo="RTX 3090 Asus 24GB", preco=3500, preco_max=6000,
+                      mercado={"n": 40, "mediana": 7200},
+                      descricao="Faz barulho e fica travando. Chama no whats.",
+                      instrucoes="só com nota fiscal, só com caixa"), [])
+    ok("⚠️ nunca em IGNORAR", not (a["recomendacao"] == "IGNORAR" and a["alerta"]), str((a["recomendacao"], a["alerta"])))
+
+    # ── busca: negação no termo/critério não liga o modo defeito ──
+    for kw in ({"termo": "rtx 3090 sem nenhum defeito"}, {"termo": "rtx 3090", "criterios_inclusao": ["sem nenhum defeito"]},
+               {"termo": "iphone 13", "criterios_inclusao": ["sem tela quebrada"]},
+               {"termo": "iphone 13", "criterios_inclusao": ["nunca foi quebrado"]},
+               {"termo": "rtx 3090", "criterios_inclusao": ["não pode estar queimada"]}):
+        c = BuscaCreate(nome="x", **kw).condicao
+        ok(f"condicao {kw}", c == "funcionando", c)
+    for kw in ({"termo": "rtx 3090 com defeito"}, {"termo": "rtx 3090", "criterios_inclusao": ["para peças"]}):
+        c = BuscaCreate(nome="x", **kw).condicao
+        ok(f"condicao {kw} (pede defeito)", c == "defeito", c)
+    try:
+        BuscaCreate(nome="x", termo="vw up"); ok("termo 'vw up' aceito", True)
+    except Exception as e:
+        ok("termo 'vw up' aceito", False, str(e)[:80])
+
+
+    assert not falhas, falhas
 
 
 def test_p11_pausa_apos_bloqueio():

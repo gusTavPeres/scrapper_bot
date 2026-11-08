@@ -477,14 +477,12 @@ def upsert_anuncio(busca_id: int, dados: dict) -> tuple[int, bool, float | None]
                | {"id": aid})
             if dados.get("titulo") and dados["titulo"] != existente["titulo"]:
                 # vendedor editou o título (ex.: corrigiu o modelo): reavalia
-                conn.execute("INSERT OR IGNORE INTO fila (anuncio_id, busca_id, prioridade) "
-                             "VALUES (?, ?, 2)", (aid, busca_id))
+                conn.execute(_ENFILEIRA, (aid, busca_id, 2))
             if preco > 0 and existente["preco"] != preco:
                 conn.execute("INSERT INTO historico_precos (anuncio_id, preco) VALUES (?, ?)",
                              (aid, preco))
                 conn.execute("UPDATE anuncios SET preco=? WHERE id=?", (preco, aid))
-                conn.execute("INSERT OR IGNORE INTO fila (anuncio_id, busca_id, prioridade) "
-                             "VALUES (?, ?, 2)", (aid, busca_id))
+                conn.execute(_ENFILEIRA, (aid, busca_id, 2))
                 return aid, False, existente["preco"]
             return aid, False, None
 
@@ -532,16 +530,19 @@ def atualizar_descricao(anuncio_id: int, busca_id: int, descricao: str):
     """Grava a descrição e re-enfileira: a avaliação só-título é inferior."""
     with get_conn() as conn:
         conn.execute("UPDATE anuncios SET descricao=? WHERE id=?", (descricao, anuncio_id))
-        conn.execute("""INSERT OR IGNORE INTO fila (anuncio_id, busca_id, prioridade)
-                        VALUES (?, ?, 1)""", (anuncio_id, busca_id))
+        conn.execute(_ENFILEIRA, (anuncio_id, busca_id, 1))
+
+
+# Evento que pode alertar (anúncio novo, descrição, preço, título) sobe a
+# prioridade de quem já está na fila. Com INSERT OR IGNORE, o anúncio que um
+# reinício ou um 👍 tinha posto em -1 (silencioso) ficava -1: o alerta sumia
+_ENFILEIRA = """INSERT INTO fila (anuncio_id, busca_id, prioridade) VALUES (?, ?, ?)
+                ON CONFLICT(anuncio_id) DO UPDATE SET prioridade=MAX(prioridade, excluded.prioridade)"""
 
 
 def adicionar_fila(anuncio_id: int, busca_id: int, prioridade: int = 0):
     with get_conn() as conn:
-        conn.execute("""
-            INSERT OR IGNORE INTO fila (anuncio_id, busca_id, prioridade)
-            VALUES (?, ?, ?)
-        """, (anuncio_id, busca_id, prioridade))
+        conn.execute(_ENFILEIRA, (anuncio_id, busca_id, prioridade))
 
 
 def obter_fila_pendente(limite: int = 5000) -> list[dict]:
@@ -694,9 +695,9 @@ def stats_busca(busca_id: int) -> dict:
             SELECT
                 COUNT(a.id) as total,
                 AVG(an.score) as score_medio,
-                MIN(a.preco) as preco_min,
+                MIN(NULLIF(a.preco, 0)) as preco_min,      -- "a combinar" (0) não é preço
                 MAX(a.preco) as preco_max,
-                AVG(a.preco) as preco_medio,
+                AVG(NULLIF(a.preco, 0)) as preco_medio,
                 COUNT(CASE WHEN an.recomendacao='COMPRAR' THEN 1 END) as qtd_comprar,
                 COUNT(CASE WHEN an.recomendacao='VER' THEN 1 END) as qtd_ver,
                 COUNT(CASE WHEN an.recomendacao='IGNORAR' THEN 1 END) as qtd_ignorar
@@ -706,15 +707,15 @@ def stats_busca(busca_id: int) -> dict:
         """, (busca_id,)).fetchone()
 
         historico = conn.execute("""
-            SELECT DATE(hp.registrado_em) as dia,
+            SELECT DATE(hp.registrado_em, '-3 hours') as dia,     -- dia de Brasília, não UTC
                    AVG(hp.preco) as preco_medio,
                    MIN(hp.preco) as preco_min,
                    COUNT(*) as quantidade
             FROM historico_precos hp
             JOIN anuncios a ON a.id = hp.anuncio_id
             JOIN analises an ON an.anuncio_id = a.id AND an.decisao='APROVADO'
-            WHERE a.busca_id=?
-            GROUP BY DATE(hp.registrado_em)
+            WHERE a.busca_id=? AND hp.preco > 0
+            GROUP BY DATE(hp.registrado_em, '-3 hours')
             ORDER BY dia DESC
             LIMIT 30
         """, (busca_id,)).fetchall()

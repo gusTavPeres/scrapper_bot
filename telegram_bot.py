@@ -75,8 +75,20 @@ _PRECO_TXT = {"bom": "preço bom", "justo": "preço justo", "caro": "caro", "sus
 
 
 def _inteiro(v: str) -> int:
-    """'1.900', '1900', '1.900,00' -> 1900 (ponto de milhar é o jeito brasileiro)."""
-    return int(float(v.replace(".", "").replace(",", ".")))
+    """'1.900', '1900', '1.900,00' -> 1900 (ponto de milhar é o jeito brasileiro).
+    'inf'/'1e400' viravam OverflowError -> "erro interno"; agora é valor inválido."""
+    try:
+        return int(float(v.replace(".", "").replace(",", ".")))
+    except OverflowError:
+        raise ValueError(v) from None
+
+
+def _id(v: str) -> int:
+    """Id de busca: número além do INTEGER do SQLite dava "erro interno"."""
+    n = int(v)
+    if not 0 < n < 2 ** 63:
+        raise ValueError(v)
+    return n
 
 
 def _parse_add(args: list[str], tipo: str = "produto"):
@@ -236,7 +248,7 @@ def tratar_comando(texto: str) -> str:
         bid = None
         if len(partes) > 1:
             try:
-                bid = int(partes[1])
+                bid = _id(partes[1])
             except ValueError:
                 return "Uso: /top [id da busca]"
         tops = db.top_analises(bid)
@@ -252,7 +264,7 @@ def tratar_comando(texto: str) -> str:
 
     if cmd == "categorias":
         try:
-            bid = int(partes[1])
+            bid = _id(partes[1])
         except (IndexError, ValueError):
             return "Uso: /categorias &lt;id&gt; [números|todas]"
         busca = db.obter_busca(bid)
@@ -283,7 +295,7 @@ def tratar_comando(texto: str) -> str:
 
     if cmd in ("pausar", "retomar", "del", "scan"):
         try:
-            bid = int(partes[1])
+            bid = _id(partes[1])
         except (IndexError, ValueError):
             return f"Uso: /{cmd} &lt;id&gt;  (veja os ids com /buscas)"
         busca = db.obter_busca(bid)
@@ -308,6 +320,17 @@ def tratar_comando(texto: str) -> str:
         return f"🗑 Busca #{bid} ({nome}) apagada."
 
     return "Comando desconhecido — /help"
+
+
+class _Recusa(Exception):
+    """getUpdates com ok=false: antes o laço repetia sem pausa (~10 req/s p/
+    sempre, sem log) com token revogado (401), outra instância no mesmo token
+    (409) ou limite (429)."""
+    def __init__(self, dados: dict):
+        cod = dados.get("error_code")
+        super().__init__(f"Telegram recusou o getUpdates ({cod}): {dados.get('description')}")
+        self.espera = ((dados.get("parameters") or {}).get("retry_after") or 30 if cod == 429
+                       else 300 if cod in (401, 404) else 30)
 
 
 def _sessao_tg() -> requests.Session:
@@ -349,7 +372,10 @@ async def loop_comandos():
             r = await asyncio.to_thread(
                 http.get, f"{api}/getUpdates",
                 params={"timeout": 50, "offset": offset}, timeout=60)
-            for up in r.json().get("result", []):
+            dados = r.json()
+            if not dados.get("ok", True):
+                raise _Recusa(dados)
+            for up in dados.get("result", []):
                 offset = up["update_id"] + 1
                 cq = up.get("callback_query")
                 if cq:
@@ -391,7 +417,7 @@ async def loop_comandos():
             espera = 2
         except Exception as e:
             logger.warning(f"telegram polling: {sem_token(e)}")
-            espera = 5
+            espera = getattr(e, "espera", 5)
         else:
             continue
         await asyncio.sleep(espera)

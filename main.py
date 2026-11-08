@@ -122,6 +122,9 @@ async def _watchdog():
 async def lifespan(app: FastAPI):
     if not SENHA:
         raise RuntimeError("BOT_PASS vazio no .env — defina uma senha para o painel")
+    if not (SENHA.isascii() and USUARIO.isascii()):
+        # o HTTP Basic do FastAPI decodifica em ASCII: com acento, o painel nunca abria
+        raise RuntimeError("BOT_USER/BOT_PASS sem acento (só caracteres ASCII)")
     db.init_db()
     avaliador.set_broadcast(broadcast)
     scheduler.set_broadcast(broadcast)
@@ -143,6 +146,26 @@ app = FastAPI(title="Monitor OLX", docs_url=None, redoc_url=None, openapi_url=No
               lifespan=lifespan)
 
 
+# Outro site aberto no navegador podia mandar POST/PATCH/DELETE ao painel (o
+# navegador reenvia a senha Basic guardada) e abrir o /ws. Navegador moderno
+# manda Sec-Fetch-Site; script/curl não manda e segue valendo
+_MESMO_SITE = ("same-origin", "none")
+
+
+@app.middleware("http")
+async def so_do_proprio_painel(request, call_next):
+    if request.method not in ("GET", "HEAD", "OPTIONS") \
+            and request.headers.get("sec-fetch-site", "none") not in _MESMO_SITE:
+        return JSONResponse(status_code=403, content={"detail": "requisição de outro site recusada"})
+    return await call_next(request)
+
+
+@app.exception_handler(OverflowError)
+async def numero_gigante(request, exc: OverflowError):
+    """id/offset maior que o INTEGER do SQLite dava 500."""
+    return JSONResponse(status_code=422, content={"detail": "número grande demais"})
+
+
 @app.exception_handler(RequestValidationError)
 async def erro_de_validacao(request, exc: RequestValidationError):
     """Mensagem em português no painel (o padrão do pydantic é em inglês)."""
@@ -159,7 +182,7 @@ async def websocket_endpoint(ws: WebSocket):
         autorizado = tipo.lower() == "basic" and _credenciais_ok(usuario, senha)
     except ValueError:
         autorizado = False
-    if not autorizado:
+    if not autorizado or ws.headers.get("sec-fetch-site", "none") not in _MESMO_SITE:
         await ws.close(code=1008)
         return
     await ws_manager.conectar(ws)
@@ -202,6 +225,8 @@ async def atualizar_busca(bid: int, dados: BuscaUpdate, _=Depends(verificar_auth
         raise HTTPException(422, "preço mínimo maior que o preço máximo")
     if not final["termo"] and final["tipo"] != "carro":
         raise HTTPException(422, "termo obrigatório (só carro aceita busca sem modelo)")
+    if not final["termo"] and not (final.get("filtros_extra") or final["preco_min"] or final["preco_max"]):
+        raise HTTPException(422, "busca de carros sem modelo exige ao menos um filtro (ano, km, motor ou preço)")
     mudou = db.atualizar_busca(bid, campos)
     await broadcast({"tipo": "busca_status", "busca_id": bid})
     return {"ok": True, "alterados": sorted(mudou)}
@@ -225,6 +250,7 @@ async def retomar(bid: int, _=Depends(verificar_auth)):
 
 @app.delete("/api/buscas/{bid}")
 async def deletar(bid: int, _=Depends(verificar_auth)):
+    _busca_ou_404(bid)
     db.deletar_busca(bid)
     await broadcast({"tipo": "busca_deletada", "busca_id": bid})
     return {"ok": True}

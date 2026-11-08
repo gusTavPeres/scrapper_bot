@@ -24,7 +24,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -59,6 +59,7 @@ class OlxIndisponivel(Exception):
 
 _RE_SCRIPT = re.compile(r"<script[^>]*>(.*?)</script>", re.S)
 _RE_LDJSON = re.compile(r"<script[^>]*application/ld\+json[^>]*>(.*?)</script>", re.S)
+_JSON = json.JSONDecoder()
 
 
 def _extrair_preco(texto) -> float:
@@ -74,37 +75,18 @@ def _extrair_preco(texto) -> float:
 
 
 def _achar_array_json(texto: str, chave: str):
-    """Acha `chave` no texto e parseia o array JSON que a segue (bracket-match
-    respeitando strings/escapes). Retorna list ou None."""
+    """Acha `chave` no texto e parseia o array JSON que a segue. Retorna list ou
+    None. raw_decode lê só aquele valor (em C: 11x mais rápido que casar
+    colchetes em Python, ~7 ms -> 0,6 ms numa página de 50 anúncios)."""
     # só se o VALOR da chave for uma lista ("ads": null seguido de outra lista
     # qualquer não pode virar a lista de anúncios)
     m = re.search(re.escape(chave) + r"\s*:\s*\[", texto)
     if not m:
         return None
-    start = m.end() - 1
-    depth, in_str, esc = 0, False, False
-    for pos in range(start, len(texto)):
-        ch = texto[pos]
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-        else:
-            if ch == '"':
-                in_str = True
-            elif ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(texto[start:pos + 1])
-                    except Exception:
-                        return None
-    return None
+    try:
+        return _JSON.raw_decode(texto, m.end() - 1)[0]
+    except ValueError:
+        return None
 
 
 def _mapear_flight_ad(ad: dict) -> dict | None:
@@ -193,8 +175,11 @@ def _anuncios_do_flight(texto: str) -> list[dict] | None:
         # busca vazia vem com "ads":[] e totalOfAds 0; sem a lista E sem o total
         # zerado = formato novo. Tratar como "vazia" deixaria o bot cego em silêncio
         return [] if re.search(r'"totalOfAds"\s*:\s*0\b', texto) else None
+    lista = _achar_array_json(texto, '"ads"')
+    if lista is None and re.search(r'"ads"\s*:\s*\[', texto):
+        return None        # lista que abre e não fecha = resposta truncada, não "fim"
     produtos = []
-    for ad in _achar_array_json(texto, '"ads"') or []:
+    for ad in lista or []:
         try:
             if (p := _mapear_flight_ad(ad)):
                 produtos.append(p)
@@ -398,6 +383,17 @@ def _passa_filtros_carro(busca: dict, p: dict) -> bool:
 
 # ── RASPAGEM ──────────────────────────────────────────────
 
+def _ja_lido(ads: list[dict], busca: dict) -> bool:
+    """Página sem nada que passe nos filtros locais (ex.: busca "com envio" e só
+    anúncios sem envio): o monitor só para quando o mais velho dela é anterior à
+    última leitura. Antes parava ali e o novo da pág. 2 esperava o full diário."""
+    try:
+        ultimo = datetime.fromisoformat(busca["ultimo_scan"]).replace(tzinfo=timezone.utc)
+        return min(datetime.fromisoformat(a["data_postagem"]) for a in ads) < ultimo
+    except (KeyError, TypeError, ValueError):
+        return True        # sem datas: para, como antes
+
+
 async def raspar_busca(busca: dict, fase: str) -> list[dict]:
     """SCAN: todas as páginas (até 25). MONITOR: as mais novas por data, até a
     primeira página sem NENHUM anúncio novo p/ o banco (antes eram 2 fixas: mais
@@ -425,7 +421,8 @@ async def raspar_busca(busca: dict, fase: str) -> list[dict]:
             # alcançou o que já tinha visto (descartado pelos filtros locais nunca é
             # gravado: se contasse como "novo", o monitor nunca pararia cedo)
             relevantes = filtrar_produtos(busca, novos)
-            if fase == "monitor" and len(db.conhecidos(busca["id"], relevantes)) == len(relevantes):
+            if fase == "monitor" and (len(db.conhecidos(busca["id"], relevantes)) == len(relevantes)
+                                      if relevantes else _ja_lido(novos, busca)):
                 break
             _broadcast({"tipo": "scraping", "busca_id": busca["id"],
                         "pagina": pagina, "encontrados": len(todos)})
@@ -476,6 +473,8 @@ async def _atualizar_mercado(busca: dict):
                            if a["preco"] > 0 and avaliador.triagem(busca, a)[0]
                            and not avaliador.tem_defeito(a, busca.get("tipo"))]
                 await asyncio.sleep(1.5)
+        if _editada(busca, db._MUDA_MERCADO):
+            return                 # editada durante a medição: a mediana é do termo antigo
         resumo = avaliador.resumo_mercado(precos)
         db.salvar_mercado(busca["id"], resumo or {"n": len(precos)})
         logger.info(f"[{nome}] mercado: " + (
@@ -484,6 +483,7 @@ async def _atualizar_mercado(busca: dict):
             if resumo else f"amostra pequena ou dispersa demais ({len(precos)} anúncios), sem referência"))
     except Exception as e:
         logger.warning(f"[{nome}] medição de mercado falhou: {e}")
+        _bloqueio(e)
 
 
 # ── LOOP PRINCIPAL ────────────────────────────────────────
@@ -502,6 +502,23 @@ _olx_alertado = False
 # bloqueio. Insistir no bloqueio só piora o histórico do IP.
 OLX_PAUSA = 900
 _olx_pausa_ate = 0.0
+
+
+def _bloqueio(e: Exception) -> bool:
+    """403/429 em QUALQUER leitura (busca, mercado, checagem diária): TODAS as
+    buscas esperam OLX_PAUSA. Insistir no bloqueio só piora o histórico do IP."""
+    global _olx_pausa_ate
+    if isinstance(e, OlxIndisponivel) and re.match(r"(403|429) ", str(e)):
+        _olx_pausa_ate = time.monotonic() + OLX_PAUSA
+        logger.info(f"bloqueio da OLX: buscas pausadas por {OLX_PAUSA // 60} min")
+        return True
+    return False
+
+
+def _editada(antes: dict, campos: set) -> bool:
+    """A busca foi editada (ou apagada) enquanto a rodada corria?"""
+    atual = db.obter_busca(antes["id"])
+    return not atual or any(atual.get(k) != antes.get(k) for k in campos)
 
 
 async def _olx_respondeu():
@@ -593,10 +610,17 @@ async def _canario():
                 problemas.append("não vem mais em ordem de data (o monitor perderia os novos)")
             if ads:
                 await asyncio.sleep(1.5)
-                if len(extrair_descricao((await _baixar(sessao, ads[0]["url"])).text)) < 10:
+                try:
+                    desc = extrair_descricao((await _baixar(sessao, ads[0]["url"])).text)
+                except OlxIndisponivel:
+                    raise
+                except Exception:      # 404/5xx na página do anúncio: é defeito a avisar
+                    desc = ""
+                if len(desc) < 10:
                     problemas.append("a descrição do anúncio não sai mais")
     except Exception as e:             # bloqueio/rede: não é formato; tenta em 1 h
         _canario_proximo = time.monotonic() + 3600
+        _bloqueio(e)
         (logger.info if isinstance(e, OlxIndisponivel) else logger.warning)(
             f"checagem diária da OLX adiada 1 h: {e!r}")
         return
@@ -616,6 +640,11 @@ async def ciclo(timeout_busca: float = 900):
     for busca in buscas:
         if time.monotonic() < _olx_pausa_ate:      # a anterior levou 403 agora
             break
+        # relida: a lista é do início do ciclo, e a busca pode ter sido pausada,
+        # apagada ou editada enquanto as anteriores rodavam
+        busca = db.obter_busca(busca["id"])
+        if not busca or busca["status"] == "pausada":
+            continue
         ultimo_ciclo = time.monotonic()           # heartbeat por busca, não por ciclo
         try:
             # 15 min por busca: uma travada não congela o resto p/ sempre
@@ -651,7 +680,6 @@ async def processar_busca(busca: dict):
     """Raspa, grava, faz a triagem de identidade e baixa descrições. O STATUS
     não é tocado no início: uma interrupção no meio (timeout, reinício,
     desligamento) deixa a busca exatamente como estava, ainda processável."""
-    global _olx_pausa_ate
     bid, nome = busca["id"], busca.get("nome", str(busca["id"]))
     fase = busca.get("fase") or "scan"
     # full re-scan diário: renova ultima_vez de TODOS os anúncios (detecção de
@@ -664,7 +692,6 @@ async def processar_busca(busca: dict):
 
     try:
         produtos = await raspar_busca(busca, fase)
-        await _olx_respondeu()
         brutos = len(produtos)
         produtos = filtrar_produtos(busca, produtos)
         logger.info(f"[{nome}] {len(produtos)} anúncios coletados"
@@ -704,9 +731,19 @@ async def processar_busca(busca: dict):
 
         # descrição antes da avaliação (novos + backfill), só de quem passou na triagem
         await _preencher_descricoes(busca)
+        # só agora a OLX "respondeu": página de anúncio bloqueada (403) sem isto
+        # zerava o contador a cada rodada e o aviso de 1 h nunca saía
+        await _olx_respondeu()
 
-        # scan vazio NÃO vira monitor (erro silencioso / busca sem resultado ainda)
-        db.concluir_scan(bid, busca["intervalo_min"], scan_completo=fase == "scan" and bool(produtos))
+        if _editada(busca, db._MUDA_SCAN | db._MUDA_MERCADO):
+            # a edição já reagendou um scan completo: concluir aqui o desfaria (e
+            # mediria o mercado do termo antigo)
+            logger.info(f"[{nome}] editada durante a rodada: novo scan já agendado")
+            return
+        # scan vazio NÃO vira monitor (erro silencioso / busca sem resultado ainda).
+        # Conta o que a OLX devolveu, não o que passou nos filtros locais: busca
+        # com tudo filtrado refazia o scan completo (25 págs) a cada intervalo
+        db.concluir_scan(bid, busca["intervalo_min"], scan_completo=fase == "scan" and brutos > 0)
         _broadcast({"tipo": "busca_concluida", "busca_id": bid, "fase": fase,
                     "novos": novos, "total": len(produtos)})
         if db.mercado_vencido(bid):
@@ -717,10 +754,10 @@ async def processar_busca(busca: dict):
         db.registrar_erro(bid, busca["intervalo_min"])
         if isinstance(e, OlxIndisponivel):
             await _olx_falhou(e)
-            if re.match(r"(403|429) ", str(e)):      # bloqueio (layout mudado não pausa)
-                _olx_pausa_ate = time.monotonic() + OLX_PAUSA
-                logger.info(f"bloqueio da OLX: buscas pausadas por {OLX_PAUSA // 60} min")
-        elif db.sem_sucesso_ha(bid, 6):       # rede/servidor falhando há horas: não ficar mudo
+        # bloqueio pausa tudo e tem o aviso de 1 h; qualquer outra falha (layout de
+        # UMA categoria mudou, rede) avisa após 6 h — antes, "layout mudou" de uma
+        # busca ficava mudo se as outras lessem normal (zeravam o contador global)
+        if not _bloqueio(e) and db.sem_sucesso_ha(bid, 6):
             await asyncio.to_thread(
                 notifier.alertar, f"falha:{bid}",
                 f"⚠️ <b>{notifier.esc(nome)}</b> está falhando há mais de 6 h: "

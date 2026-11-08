@@ -421,8 +421,10 @@ async function acao(promessa, ok) {
     await promessa;
     if (ok) toast(ok, "ok");
     carregarBuscas();
+    return true;
   } catch (e) {
     toast("Erro: " + e.message, "err");
+    return false;
   }
 }
 
@@ -432,7 +434,7 @@ const scanAgora = bid => acao(api("POST", `/buscas/${bid}/scan-agora`), "Scan ag
 
 async function deletarBusca(bid) {
   if (!confirm("Deletar esta busca e todos os resultados?")) return;
-  await acao(api("DELETE", `/buscas/${bid}`));
+  if (!await acao(api("DELETE", `/buscas/${bid}`))) return;   // falhou: a busca continua lá
   buscaAtiva = null;
   voltarLista();
   document.getElementById("main-area").innerHTML =

@@ -8,6 +8,7 @@ import asyncio
 import html
 import logging
 import os
+import re
 import time
 
 import requests
@@ -42,8 +43,15 @@ def _brl(v) -> str:
     return "R$ " + f"{v or 0:,.0f}".replace(",", ".")
 
 
+# a última falha do _post foi de rede/servidor (vale tentar de novo) ou recusa
+# definitiva (4xx: mensagem inválida — reenviar não adianta)?
+falha_de_rede = False
+
+
 def _post(metodo: str, dados: dict, timeout: int) -> bool:
     """`dados` pode trazer chat_id próprio (resposta a quem ainda não está no .env)."""
+    global falha_de_rede
+    falha_de_rede = False
     if not TOKEN or not (CHAT_ID or dados.get("chat_id")):
         logger.warning("Telegram não configurado.")
         return False
@@ -52,9 +60,11 @@ def _post(metodo: str, dados: dict, timeout: int) -> bool:
                           json={"chat_id": CHAT_ID, "parse_mode": "HTML", **dados},
                           timeout=timeout)
         if not r.ok:
+            falha_de_rede = r.status_code == 429 or r.status_code >= 500
             logger.error(f"Telegram {metodo} recusou ({r.status_code}): {r.text[:200]}")
         return r.ok
     except Exception as e:
+        falha_de_rede = True
         logger.error(f"Telegram {metodo}: {sem_token(e)}")
         return False
 
@@ -70,14 +80,22 @@ def teclado(anuncio_id, marcado=None) -> dict | None:
 
 
 def _partes(texto: str, limite: int = 4096) -> list[str]:
-    """Divide em linhas inteiras (cortar no meio de uma tag HTML faz o Telegram
-    recusar a mensagem toda)."""
+    """Divide em linhas inteiras, na ordem (cortar no meio de uma tag HTML faz o
+    Telegram recusar a mensagem toda). Linha sozinha maior que o limite perde as
+    tags e é cortada fora de entidade (&amp;). Nunca devolve parte vazia."""
     partes, atual = [], ""
     for linha in texto.split("\n"):
-        while len(linha) > limite:              # linha sozinha maior que o limite
-            partes.append(linha[:limite]); linha = linha[limite:]
-        if len(atual) + len(linha) + 1 > limite:
-            partes.append(atual); atual = ""
+        if atual and len(atual) + len(linha) + 1 > limite:
+            partes.append(atual)
+            atual = ""
+        if len(linha) > limite:
+            linha = re.sub(r"<[^>]+>", "", linha)
+            while len(linha) > limite:
+                corte = limite
+                if (amp := linha.rfind("&", limite - 10, limite)) >= 0 and ";" not in linha[amp:limite]:
+                    corte = amp
+                partes.append(linha[:corte])
+                linha = linha[corte:]
         atual = f"{atual}\n{linha}" if atual else linha
     return partes + [atual] if atual or not partes else partes
 

@@ -50,21 +50,39 @@ def norm(texto: str) -> str:
 
 
 _NEGADORES = {"nao", "nunca", "sem", "nem", "zero", "jamais", "nenhum", "nenhuma",
-              "isento", "isenta", "livre"}
+              "isento", "isenta", "livre", "contra", "nada"}   # "garantia contra defeitos", "nada de mineração"
+# enchimento entre o negador e a chave: "não apresenta qualquer tipo de defeito"
+_ENCHIMENTO = re.compile(r"\b(?:qualquer tipo de|nenhum tipo de|tipo de|qualquer)\b")
 
 
 _FRONTEIRA = re.compile(r"[.!?;,\n]|\b(?:mas|porem|contudo|entretanto)\b")
 
 
+def _negado(trecho: str) -> bool:
+    return bool(_NEGADORES & set(re.findall(r"[a-z]+", _ENCHIMENTO.sub(" ", trecho))[-4:]))
+
+
 def ocorrencias(texto: str, chave: str) -> list[tuple[bool, str]]:
     """[(negada, oração em volta)] de cada ocorrência de `chave` (texto normalizado).
     Negação vale dentro da mesma oração, até 4 palavras antes: "nunca foi usada
-    em mineração" (negada) · "sem riscos, mas com defeito" (afirmada)."""
+    em mineração" (negada) · "sem riscos, mas com defeito" (afirmada). Chave
+    terminada em "$" exige fim de palavra ("nao liga$" não casa "não ligar")."""
+    fim = r"(?![a-z])" if chave.endswith("$") else ""
     out = []
-    for m in re.finditer(r"(?<![a-z0-9])" + re.escape(chave), texto):
-        antes = _FRONTEIRA.split(texto[max(0, m.start() - 60):m.start()])[-1]
+    for m in re.finditer(r"(?<![a-z0-9])" + re.escape(chave.rstrip("$")) + fim, texto):
+        janela = texto[max(0, m.start() - 60):m.start()]
+        antes = _FRONTEIRA.split(janela)[-1]
         depois = _FRONTEIRA.split(texto[m.start():m.start() + 80])[0]
-        out.append((bool(_NEGADORES & set(re.findall(r"[a-z]+", antes)[-4:])), antes + depois))
+        # "sem garantia e com defeito": o "e com" afirma de novo
+        negada = _negado(re.split(r"\b(?:e|mas)\s+com\b", antes)[-1])
+        if not negada and re.search(r"\b(?:ou|nem)\s*$", antes):
+            # "não possui riscos, amassados ou defeitos": a lista herda a negação
+            itens = re.split(r"[.!?;\n]|\b(?:mas|porem|contudo|entretanto)\b", janela)[-1].split(",")
+            if len(itens) > 1 and all(len(re.findall(r"[a-z]+", x)) <= 3 for x in itens[1:]):
+                negada = _negado(itens[0])
+        if not negada and re.match(r"[a-z]*\s*:\s*(?:nenhum|nenhuma|nao|zero)\b", texto[m.end():]):
+            negada = True                       # "Defeitos: nenhum"
+        out.append((negada, antes + depois))
     return out
 
 
@@ -82,8 +100,19 @@ def _radical(p: str) -> str:
     return p[:-1] if len(p) > 4 and p[-1] in "aeo" else p
 
 
+_MINERACAO = ("mineraca", "minerad", "minerou", "minerand", "mining")
+
+
+def _afirmado_regra(texto: str, radical: str):
+    """Como afirmado(), mas "mineração" da regra casa "minerada"/"minerou" do anúncio."""
+    if radical.startswith("minera"):
+        r = [afirmado(texto, c) for c in _MINERACAO]
+        return True if any(r) else False if False in r else None
+    return afirmado(texto, radical)
+
+
 def _todos_afirmados(texto: str, radicais: list[str]) -> bool:
-    return all(afirmado(texto, r) for r in radicais)
+    return all(_afirmado_regra(texto, r) for r in radicais)
 
 
 # ── 1. IDENTIDADE ─────────────────────────────────────────
@@ -95,9 +124,10 @@ _UNIDADES = {"gb", "tb", "mb", "mhz", "ghz", "hz", "w", "v", "fe", "oc", "mm", "
              "cc", "cil", "cv", "hp", "km", "kg", "ml", "l", "litros", "cm", "mah", "mp",
              "rpm", "fps", "bit", "bits", "btu", "btus", "kw", "kva"}
 # "CPU gamer" no Brasil = o PC inteiro; processador antes do produto = montagem
-_CONJUNTOS = ("notebook", "laptop", "computador", "pc", "kit", "workstation", "setup completo",
-              "cpu gamer", "cpu completa", "maquina gamer", "maquina para", "maquina completa",
-              "servidor", "gabinete", "ryzen", "xeon")       # "máquina de lavar" é produto
+_CONJUNTOS = ("notebook", "laptop", "computador", "pc", "kit", "workstation", "setup", "desktop",
+              "cpu", "note", "maquina gamer", "maquina para", "maquina completa",
+              "servidor", "gabinete", "ryzen", "xeon", "i3", "i5", "i7", "i9")  # "máquina de lavar" é produto
+_PROCESSADORES = ("ryzen", "xeon", "i3", "i5", "i7", "i9", "cpu")
 # "placa RTX 3090 para PC" / "tirada do meu computador" = é a peça, não o PC
 _PREPOSICOES = {"para", "pra", "p", "de", "do", "da", "no", "na", "meu", "minha", "seu",
                 "em", "num", "dum", "ex"}
@@ -113,17 +143,22 @@ _ACESSORIOS = ("capa", "capinha", "pelicula", "case", "cabo", "suporte", "waterb
                "radiador", "alternador", "embreagem", "modulo", "central", "sensor", "bomba",
                "pastilha", "disco", "calota", "spoiler", "aerofolio", "moldura", "tapete",
                "vidro", "lente", "chave", "painel", "escapamento", "ponteira", "carburador",
-               "tanque", "carenagem", "guidao", "bauleto", "cilindro", "pedal", "selim", "quadro")
+               "tanque", "carenagem", "guidao", "bauleto", "cilindro", "pedal", "selim", "quadro",
+               "embalagem")
 # marca sozinha não identifica: "fiat linea" não pode aceitar "Fiat Palio"
 _MARCAS = {"fiat", "chevrolet", "volkswagen", "ford", "toyota", "honda", "hyundai",
            "renault", "nissan", "peugeot", "citroen", "jeep", "mitsubishi", "chery",
            "suzuki", "volvo", "audi", "mercedes", "dodge", "nvidia", "geforce", "radeon",
            "apple", "samsung", "xiaomi", "motorola", "asus", "gigabyte", "galax", "zotac",
-           "intel", "sony", "microsoft", "nintendo", "lenovo", "dell", "acer"}
+           "intel", "sony", "microsoft", "nintendo", "lenovo", "dell", "acer", "vw", "gm", "lg", "jbl"}
 # descrevem o estado/categoria, não identificam o produto ("rtx 3090 com defeito")
 _DESCRITIVAS = {"defeito", "defeituosa", "defeituoso", "quebrada", "quebrado", "usado", "usada",
                 "novo", "nova", "lacrado", "lacrada", "seminovo", "seminova", "placa", "video",
-                "original", "barato", "barata", "funcionando", "pecas", "reparo", "gamer"}
+                "original", "barato", "barata", "funcionando", "pecas", "reparo", "gamer", "console"}
+# variantes sem número que se excluem: "switch oled" x "switch lite", "macbook pro" x "air"
+_VARIANTES = ({"lite", "oled"}, {"air", "pro"})
+# ano (1950-2039) não é modelo: "Civic 2018/2019", "RTX 3070, 2021" (a série 20 da RTX é 2050+)
+_e_ano = lambda n: len(n) == 4 and 1950 <= int(n) <= 2039
 # homônimos: o acessório É o produto ("caixa de som JBL", "Cooler Master ...")
 _NAO_ACESSORIO = ("caixa de som", "cooler master")
 _SO_ACESSORIO = ("caixa vazia", "caixas vazias", "so a caixa", "somente a caixa",
@@ -131,15 +166,17 @@ _SO_ACESSORIO = ("caixa vazia", "caixas vazias", "so a caixa", "somente a caixa"
                  "so o chip", "somente o chip")
 
 
-def _sufixos(ti: str, num: str, inicio: int) -> frozenset:
-    """Sufixos de modelo logo após o número: '3090ti', '3090 ti', '13 pro max'."""
+def _sufixos(ti: str, num: str, inicio: int, fe: bool = False) -> frozenset:
+    """Sufixos de modelo logo após o número: '3090ti', '3090 ti', '13 pro max'.
+    `fe`: "FE" é variante (Galaxy S23 FE), não "Founders Edition" de placa."""
     resto = ti[inicio + len(num):]
+    sufixos, unidades = (_SUFIXOS | {"fe"}, _UNIDADES - {"fe"}) if fe else (_SUFIXOS, _UNIDADES)
     out = set()
     colado = re.match(r"([a-z]+\d*[a-z]*)", resto)
-    if colado and colado.group(1) not in _UNIDADES:
+    if colado and colado.group(1) not in unidades:
         out.add(colado.group(1))
     for tok in re.findall(r"[a-z0-9]+", resto)[(1 if colado else 0):][:3]:
-        if tok not in _SUFIXOS:
+        if tok not in sufixos:
             break
         out.add(tok)
     return frozenset(out)
@@ -166,9 +203,10 @@ def termo_de_busca(termo: str) -> str:
     return " ".join(ficam) or termo
 
 
-_RE_TROCA = re.compile(r"\b(troco|troca|trocar)\s+(por|em|numa?|pra|para)\b(\s+\w+){0,2}\s*$")
+_RE_TROCA = re.compile(r"\b(troco|troca|trocar)\s+(por|em|numa?|pra|para|na|no)\b(\s+\w+){0,4}\s*$")
 _RE_COMPARA = re.compile(r"(\b(melhor|pior|mais forte|mais rapida?|superior|inferior)\s+(que|a)\b|"
-                         r"\b(vs|versus|supera|bate)\b|\b(igual|equivalente|equivale|similar)\s+(a|uma?)\b|"
+                         r"\b(vs|versus|supera|bate)\b|=|"
+                         r"\b(igual|equivalente|equivale|similar|tipo|nivel)\b(\s+(a|ao|de|da|uma?)\b)?|"
                          r"\b(nivel|desempenho) de\b)(\s+\w+){0,2}\s*$")
 
 
@@ -185,6 +223,13 @@ def _so_comparacao(ti: str, i: int) -> bool:
 def produto_bate(termo: str, titulo: str) -> tuple[bool, str]:
     """(ok, motivo). Regras no TÍTULO (vendedor sempre põe o modelo lá)."""
     t, ti = (re.sub(r"(\d)\+", r"\1 plus", norm(x)) for x in (termo, titulo))
+    # "13 promax" = "13 pro max"; "playstation 5" = "ps5"; "rtx5060ti16gb": memória colada no sufixo
+    t, ti = (re.sub(r"([a-z])(\d+(?:gb|tb)\b)", r"\1 \2",
+                    re.sub(r"\bplaystation\s*(\d)", r"ps\1", re.sub(r"\bpro\s?max\b", "pro max", x)))
+             for x in (t, ti))
+    # "rtx 3090 sem mineração", "... com nota fiscal": o produto é o que vem antes
+    t = re.split(r"\b(?:com|sem|nao|nunca|nada de)\b", t)[0].strip() or t
+    fe = not re.search(r"\b(?:rtx|gtx)\b", t)
     if re.search(r"\b(compro|procuro|busco)\b|\bcompra (ou|e) troca\b", ti):
         return False, "anúncio de quem quer COMPRAR, não vender"
     if re.search(r"assistencia tecnica|\bcon[cs]ertos?\s+de\b|\bcon[cs]ertos\b|\bmanutencao (de|em)\b|"
@@ -198,18 +243,24 @@ def produto_bate(termo: str, titulo: str) -> tuple[bool, str]:
     for num in re.findall(r"(?<![\d.,])\d+(?![.,]?\d)", t):
         m_t = re.search(rf"(?<!\d){num}(?!\d)", t)
         un = _unidade_apos(t, m_t.end())       # "8gb" na busca = memória, não modelo
+        # 1 dígito depois de "com"/"e" é quantidade: "iPhone 11 com 8 meses", "PS4 e 5 jogos"
         ocorr = [m.start() for m in re.finditer(rf"(?<!\d){num}(?!\d)", ti)
                  if len(num) > 1 or (_unidade_apos(ti, m.end()) == un
-                                     and (un or re.search(r"[a-z][\s-]?$", ti[:m.start()])))]
+                                     and (un or re.search(r"[a-z][\s-]?$", ti[:m.start()]))
+                                     and (re.findall(r"[a-z]+", ti[:m.start()])[-1:] or [""])[0]
+                                     not in _CONECTIVOS | {"ou", "mais"})]
         if not ocorr:
             return False, f"título não menciona '{num}' (modelo diferente)"
-        quer = _sufixos(t, num, m_t.start())
+        quer = _sufixos(t, num, m_t.start(), fe)
         # "RTX 4080/4090/5090", "(5060, 5070, 5080)": vários modelos no título
-        # (vizinho = número de 3+ dígitos que não é memória: "RTX 3090, 24GB" é 1 modelo)
-        if all(re.search(r"\d{3,}[a-z]*\s*[/,]\s*$", ti[:i])
-               or re.match(r"[a-z]*\s*[/,]\s*(?:rtx|gtx|rx)?\s*\d{3,}(?!\d|\s*(?:gb|tb|mb|mhz|w)\b)",
-                           ti[i + len(num):])
-               for i in ocorr):
+        # (vizinho = número de 3+ dígitos que não é memória nem ano: "RTX 3090, 24GB"
+        # e "Civic 2018/2019" são 1 modelo)
+        def _vizinho(i):
+            a = re.search(r"(\d{3,})[a-z]*\s*[/,]\s*$", ti[:i])
+            d = re.match(r"[a-z]*\s*[/,]\s*(?:rtx|gtx|rx)?\s*(\d{3,})(?!\d|\s*(?:gb|tb|mb|mhz|w|km)\b)",
+                         ti[i + len(num):])
+            return bool((a and not _e_ano(a.group(1))) or (d and not _e_ano(d.group(1))))
+        if not _e_ano(num) and all(_vizinho(i) for i in ocorr):
             return False, f"título lista vários modelos ({num} é só um deles)"
         # menção que é só comparação ("RTX 3080 (melhor que a 5070)", "RX 6900 XT
         # (RTX 5070)") ou o que o vendedor QUER na troca ("RX 7600 troco por rtx
@@ -221,25 +272,43 @@ def produto_bate(termo: str, titulo: str) -> tuple[bool, str]:
         if not livres:
             return False, (f"o {num} é o que o vendedor quer na TROCA, não o que vende" if troca
                            else f"o {num} só aparece como comparação, não é o que está à venda")
-        tem = [_sufixos(ti, num, i) for i in livres]
+        tem = [_sufixos(ti, num, i, fe) for i in livres]
         if quer not in tem:
             achado = " ".join(sorted(tem[0])) or "sem sufixo"
             return False, f"{num} {achado} ≠ {num} {' '.join(sorted(quer)) or 'sem sufixo'}"
         posicoes.append(livres[0])
     palavras = [p for p in re.findall(r"[a-z]{4,}", t) if p not in _DESCRITIVAS]
-    if palavras and not any(p in ti for p in palavras):
-        return False, f"título não menciona nada da busca ({', '.join(palavras[:3])})"
     especificas = [p for p in palavras if p not in _MARCAS]
+    # com o modelo (número) já batido, marca no termo não precisa estar no título
+    # ("nvidia rtx 3090" x "RTX 3090 Asus TUF")
+    checar = especificas if posicoes else palavras
+    if checar and not any(p in ti for p in checar):
+        return False, f"título não menciona nada da busca ({', '.join(checar[:3])})"
     if especificas and not posicoes and not any(p in ti for p in especificas):
         return False, f"só a marca bate; título não menciona {', '.join(especificas[:3])}"
+    if not re.search(r"\d", t):
+        # sem número, palavra curta do termo identifica: "pc gamer" x "Monitor Gamer",
+        # "fiat uno" x "Fiat Palio", "gol" x "Palio" (antes só valiam as de 4+ letras)
+        for p in re.findall(r"\b[a-z]{2,3}\b", t):
+            if p not in _CONECTIVOS | _MARCAS | _UNIDADES | _DESCRITIVAS \
+                    and not re.search(rf"(?<![a-z0-9]){p}(?![a-z0-9])", ti):
+                return False, f"título não menciona '{p}'"
+    for grupo in _VARIANTES:
+        q, a = grupo & set(re.findall(r"[a-z]+", t)), grupo & set(re.findall(r"[a-z]+", ti))
+        if q and a and not q & a:
+            return False, f"variante diferente: {', '.join(sorted(a))} ≠ {', '.join(sorted(q))}"
     # "RTX 3080 (melhor CxB entre 5050 5060 4060 4070 e 5070)": lista de modelos
+    # (ano e quilometragem não contam: "CG 160 2019/2020 com 8000 km")
     nums_termo = set(re.findall(r"\d+", t))
-    if nums_termo and len(set(re.findall(r"(?<!\d)\d{4}(?!\d)", ti)) - nums_termo) >= 3:
+    outros = {n for n in re.findall(r"(?<!\d)(\d{4})(?!\d)(?!\s?km)", ti) if not _e_ano(n)} - nums_termo
+    if nums_termo and len(outros) >= 3:
         return False, "título lista vários modelos"
     posicoes += [ti.find(p) for p in re.findall(r"[a-z0-9]{2,}", t) if p in ti]
     pos_produto = min(posicoes) if posicoes else 0
     # "Tinta para barcos, lanchas", "Película p/ iPhone 13": é item PARA o produto
-    if re.search(r"\b(?:para|pra|p)\b\W+(?:[a-z0-9]+\W+){0,2}$", ti[:pos_produto]):
+    # ("Placa de vídeo para PC RTX 3060" é a peça: "para PC" diz onde ela vai)
+    if re.search(r"\b(?:para|pra|p)\b\W+(?:[a-z0-9]+\W+){0,2}$", ti[:pos_produto]) \
+            and not re.search(r"\b(?:para|pra|p)\s+(?:pc|computador|desktop)\b", ti[:pos_produto]):
         return False, "anúncio de item PARA o produto, não do produto"
 
     for frase in _SO_ACESSORIO:
@@ -249,12 +318,21 @@ def produto_bate(termo: str, titulo: str) -> tuple[bool, str]:
     # descreve o próprio produto, não é montagem
     sistema = re.search(r"(?<![a-z0-9])(notebook|laptop|computador|pc|workstation|servidor)(?![a-z0-9])", t)
     for pal in _CONJUNTOS:
-        if pal in t or (sistema and pal in ("ryzen", "xeon")):
+        if re.search(rf"(?<![a-z0-9]){pal}(?![a-z0-9])", t) or (sistema and pal in _PROCESSADORES):
             continue
         for m in re.finditer(rf"(?<![a-z0-9]){pal}(?![a-z0-9])", ti):
+            if re.search(r"\bplaca\s+(?:de\s+)?video\b", ti[:m.start()]):
+                continue           # "Placa de Video PC Gamer RTX 3060": é a placa
             antes = re.findall(r"[a-z]+", ti[max(0, m.start() - 20):m.start()])[-2:]
             if m.start() < pos_produto or not (_PREPOSICOES & set(antes)):
                 return False, f"anúncio é de {pal}, não da peça avulsa buscada"
+    # "PS5 Controle Dualsense": acessório colado no nome do produto = é o acessório
+    # ("PS5 com controle", "PS5 2 controles", "PS5 controle extra" seguem sendo o console)
+    ultimo = (re.findall(r"[a-z0-9]+", t) or [""])[-1]
+    if ultimo and (m := re.search(rf"(?<![a-z0-9]){re.escape(ultimo)}\s+([a-z]+)(?:\s+([a-z]+))?", ti)) \
+            and m.group(1) in _ACESSORIOS and m.group(1) not in t \
+            and m.group(2) not in ("extra", "extras", "adicional", "reserva", "brinde", "de"):
+        return False, f"anúncio de acessório ({m.group(1)}), não do produto"
     for pal in _ACESSORIOS:
         if pal in t:
             continue
@@ -301,7 +379,10 @@ def triagem(busca: dict, anuncio: dict) -> tuple[bool, str]:
 # (chave, rótulo, gravidade): 3 = não funciona/inviável · 2 = funciona com
 # problema ou risco · 1 = detalhe estético (argumento de negociação, não impede)
 PROBLEMAS = [
-    ("nao liga", "não liga", 3), ("nao funciona", "não funciona", 3),
+    ("nao liga$", "não liga", 3), ("nao funciona$", "não funciona", 3),   # "favor não ligar" não é defeito
+    ("nao funcionou", "não funciona", 3), ("parou de funcionar", "parou de funcionar", 3),
+    ("nao esta funcionando", "não funciona", 3), ("nao esta ligando", "não liga", 3),
+    ("nao esta dando video", "não dá vídeo", 3), ("tela preta", "tela preta", 3),
     ("nao da video", "não dá vídeo", 3), ("sem video", "sem vídeo", 3), ("tela azul", "tela azul", 3),
     ("artefato", "artefatos na imagem", 3), ("sucata", "sucata", 3),
     ("retirada de pecas", "para peças", 3), ("para pecas", "para peças", 3),
@@ -313,6 +394,8 @@ PROBLEMAS = [
     ("ja foi reparad", "já reparado", 2), ("oxidad", "oxidação", 2), ("chiado", "chiado", 2),
     ("coil whine", "coil whine", 2), ("barulh", "barulho", 2), ("bios modificad", "BIOS modificada", 2),
     ("tela quebrad", "tela quebrada", 2), ("trincad", "trincado", 2),
+    ("quebrad", "quebrado", 2), ("rachad", "rachado", 2), ("rachou", "rachado", 2),
+    ("desligando sozinh", "desliga sozinha", 2), ("vendo como esta", "vendido no estado", 2),
     ("vendo no estado", "vendido no estado", 2), ("no estado em que", "vendido no estado", 2),
     ("risco", "riscos", 1), ("riscad", "riscos", 1), ("arranh", "arranhões", 1),
     ("marcas de uso", "marcas de uso", 1), ("sinais de uso", "marcas de uso", 1),
@@ -336,13 +419,17 @@ PROBLEMAS_CARRO = [
 # por PALAVRA: "capo" não pode casar "capotou", nem "leve" casar "levei"; "caixa"
 # e "lateral" saíram ("caixa de câmbio", "saída lateral HDMI" não são estéticos)
 _CONTEXTO_ESTETICO = re.compile(r"\b(pintura|estetic\w*|lataria|teto|capo|verniz|carcaca|adesivos?)\b")
-_ATENUANTES = re.compile(r"\b(leves?|levemente|pequen\w*|minim\w*|superficia\w*|pouco|quase nao)\b")
+# "pouco" só atenua colado no problema ("um pouco barulhenta"): "usei pouco e ela não
+# liga mais" rebaixava placa morta p/ "vale negociar"
+_ATENUANTES = re.compile(r"\b(leves?|levemente|pequen\w*|minim\w*|superficia\w*|quase nao)\b")
+# "vendo pois estou com problemas financeiros" não é problema do produto
+_PROBLEMA_PESSOAL = re.compile(r"problemas? (?:financeir|pessoa|de saude|familiar|de dinheiro)")
 NEGOCIACAO = ("aceito proposta", "aceito oferta", "aceito contraproposta", "negociavel",
               "aberto a proposta", "aberto a negociacao", "estudo proposta", "faco desconto",
               "chorinho", "da pra negociar", "pode negociar", "negocio o valor", "aceito negociar")
 # o vendedor recusou negociar ("não aceito proposta" = NEGOCIACAO negada, também conta)
 PRECO_FIXO = ("valor fixo", "preco fixo", "sem negociacao", "nao negocio", "nao baixo",
-              "sem desconto", "nao faco desconto")
+              "sem desconto", "nao faco desconto", "inegociavel")
 MARGEM_NEGOCIACAO = 0.15     # busca com teto coleta até 15% acima (se aceitar proposta)
 MARGEM_SILENCIOSA = 0.08     # sem dizer nada sobre negociar, só até 8% acima aparece
 
@@ -362,10 +449,10 @@ def problemas(texto: str, tipo: str, procurado: list[str]) -> dict[str, int]:
         if _pede(procurado, chave):
             continue
         for negada, oracao in ocorrencias(texto, chave):
-            if negada:
+            if negada or (chave == "com problema" and _PROBLEMA_PESSOAL.search(oracao)):
                 continue
             g = 1 if _CONTEXTO_ESTETICO.search(oracao) else grav
-            if _ATENUANTES.search(oracao):
+            if _ATENUANTES.search(oracao) or re.search(r"\bpouco\s+" + re.escape(chave.rstrip("$")), oracao):
                 g = max(1, g - 1)
             out[rotulo] = max(out.get(rotulo, 0), g)
     return out
@@ -427,9 +514,14 @@ def regras_do_texto(texto: str) -> list[tuple[str, list[str], str]]:
     regras = []
     for clausula in re.split(r"[,;.\n]+", norm(texto)):
         modo = "preferir"
-        for pedaco in re.split(r"\s+(?:e|ou|nem)\s+", clausula.strip()):
+        for j, pedaco in enumerate(re.split(r"\s+(?:e|ou|nem)\s+", clausula.strip())):
             pedaco = pedaco.strip()
-            for pre, m in _PREFIXOS:
+            herda = j > 0 and pedaco.startswith("com ")
+            if herda:
+                # "não quero minerada ou com defeito": o "com" do meio herda o modo
+                # (antes virava "preferir defeito" e ligava o modo defeito)
+                pedaco = pedaco[4:]
+            for pre, m in ([] if herda else _PREFIXOS):
                 if pedaco == pre or pedaco.startswith(pre + " "):
                     modo, pedaco = m, pedaco[len(pre):].strip()
                     break
@@ -659,6 +751,12 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
     for modo, radicais, frase in regras:
         if modo == "excluir" and _todos_afirmados(texto, radicais):
             return excluido(titulo, f"Critério do usuário: '{frase}'")
+        if modo == "exigir":
+            # "só com nota fiscal" + "não tenho nota fiscal" / "só 16gb" + placa de 8GB
+            mem = [r for r in radicais if re.fullmatch(r"\d+(?:gb|tb)", r)]
+            v = variante(titulo, item.get("atributos"))
+            if (mem and v and v not in mem) or any(_afirmado_regra(texto, r) is False for r in radicais):
+                return excluido(titulo, f"Critério do usuário: '{frase}' (o anúncio diz que não)")
 
     score, pros, contras, obs, motivos = 6, [], [], [], []
     # "Troco rtx 5060 por rx 9060xt": quem anuncia quer OUTRA coisa, não dinheiro.
@@ -703,7 +801,8 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
             and not _pede(procurado, "minera"):
         score -= 1
         contras.append("usada em mineração")
-    golpe, _ = _achados(texto, GOLPE, procurado)
+    golpe, _ = _achados(re.sub(r"[^.!?\n]*\b(?:cuidado|golpe|desconfie|atencao)\b[^.!?\n]*", " ", texto),
+                        GOLPE, procurado)
     if golpe:
         score -= 3
         contras.append(f"padrão de golpe: {', '.join(golpe)}")
@@ -803,7 +902,7 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
             else:                              # "valor fixo" ou longe do teto
                 score, avp = score - 2, "caro"
                 motivos.append(f"{pct}% acima do seu teto de {_brl(teto)}" + (" — preço fixo" if fixo else ""))
-        elif preco < 0.45 * teto and not barato_ok:
+        elif preco < 0.45 * teto and (not barato_ok or preco < 0.15 * teto):   # R$ 1 de placeholder
             score, avp = score - 2, "suspeito"
             obs.append(f"Preço {abs(pct)}% abaixo do seu teto — confira se não é golpe ou outro produto")
             motivos.append("preço suspeito")
@@ -813,7 +912,7 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
             motivos.append(f"dentro do seu teto de {_brl(teto)}")
     elif ref and preco > 0:
         pct = round((preco - ref) / ref * 100)
-        if pct < -40 and not barato_ok:
+        if pct < -40 and (not barato_ok or pct < -85):
             score, avp = score - 2, "suspeito"
             obs.append(f"Preço {abs(pct)}% abaixo da mediana — típico de golpe")
             motivos.append("preço suspeito")
@@ -865,7 +964,7 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
     # VALE NEGOCIAR = o preço compensa uma ressalva (problema moderado, detalhes,
     # sem descrição, pede um pouco acima do teto mas aceita proposta). Grave e
     # golpe nunca alertam
-    alerta = ("suspeita" if suspeita and not golpe and gmax < 3 and not so_troca
+    alerta = ("suspeita" if suspeita and not golpe and gmax < 3 and not so_troca and rec != "IGNORAR"
               else "comprar" if rec == "COMPRAR"
               else "negociar" if rec == "VER" and avp in ("bom", "negociavel") and gmax < 3
               and not golpe and not so_troca
@@ -886,21 +985,24 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
 
 # ── FILA ──────────────────────────────────────────────────
 
-def republicacao(item: dict) -> int | None:
-    """Id do anúncio já alertado de que este é cópia: mesmo local, preço igual ou
-    maior e título quase igual (80% das palavras). Vendedor apaga e posta de novo p/
-    subir na lista (sem isto, o mesmo anúncio repostado 3x em 1 h = 3 alertas).
-    Título curto ("RTX 5060") não identifica vendedor: fica de fora."""
+def republicacao(item: dict) -> tuple[int | None, bool]:
+    """(id do anúncio já alertado de que este parece cópia, certeza). Mesmo local,
+    preço igual ou maior e título quase igual (80% das palavras) em 14 dias =
+    republicação CERTA: vendedor apaga e posta de novo p/ subir na lista (sem isto,
+    3 reposts em 1 h = 3 alertas). Só o mesmo bairro e preço em 24 h, com outro
+    título, pode ser OUTRO vendedor (cidade grande, preço que se agrupa): alerta,
+    avisando — antes calava e perdia anúncio legítimo. Título curto ("RTX 5060")
+    não identifica vendedor: não conta como certeza."""
     palavras = lambda t: set(re.findall(r"[a-z0-9]+", norm(t)))
-    alvo = palavras(item.get("titulo"))
+    alvo, fraco = palavras(item.get("titulo")), None
     for c in db.alertados_mesmo_local(item["busca_id"], item["anuncio_id"],
                                       item.get("local"), item.get("preco")):
         outro = palavras(c["titulo"])
-        # nas últimas 24 h, o mesmo bairro e preço já basta: o vendedor pode
-        # trocar o título ("Placa de Vídeo 5060" -> "RTX 5060 8GB")
-        if c["recente"] or (len(alvo) >= 4 and len(alvo & outro) >= 0.8 * len(alvo | outro)):
-            return c["id"]
-    return None
+        if len(alvo) >= 4 and len(alvo & outro) >= 0.8 * len(alvo | outro):
+            return c["id"], True
+        if c["recente"] and fraco is None:
+            fraco = c["id"]
+    return fraco, False
 
 
 ultimo_processamento: str | None = None
@@ -960,19 +1062,32 @@ async def processar_fila(notifier=None):
                             "score": av["score"]})
             await asyncio.sleep(0)
 
+        adiados = 0
         for item, av in sorted(alertas, key=lambda x: -x[1]["score"]):     # os melhores primeiro
             r = por_busca[item["busca_id"]]
-            if (orig := republicacao(item)):         # o usuário já recebeu este anúncio
+            orig, certa = republicacao(item)
+            if orig and not certa:
+                av = {**av, "observacoes": ["Mesmo bairro e preço de um anúncio enviado há menos de "
+                                            "24 h: pode ser o mesmo vendedor reanunciando"] + av["observacoes"]}
+            if certa:                                # o usuário já recebeu este anúncio
                 db.marcar_notificado(item["anuncio_id"])
                 logger.info(f"sem alerta: republicação do anúncio {orig} — "
                             f"{(item.get('titulo') or '')[:50]}")
             elif r["alertas"] >= MAX_ALERTAS:
                 r["sem_alerta"] += 1
-            elif await notifier.enviar_resultado(item, av):
+            elif not adiados and await notifier.enviar_resultado(item, av):
                 r["alertas"] += 1
                 db.marcar_notificado(item["anuncio_id"])
                 logger.info(f"alerta {av['alerta']} enviado: [{item.get('nome')}] "
                             f"{(item.get('titulo') or '')[:50]} R$ {item.get('preco') or 0:.0f}")
+            elif adiados or getattr(notifier, "falha_de_rede", False):
+                # Telegram/rede fora: antes o alerta SUMIA (ninguém reenviava). Volta p/
+                # a fila e sai na próxima volta; os desta leva esperam junto (sem gastar
+                # um timeout em cada). Recusa definitiva (4xx) não volta: só o log
+                adiados += 1
+                db.adicionar_fila(item["anuncio_id"], item["busca_id"], max(item["prioridade"], 1))
+        if adiados:
+            logger.warning(f"Telegram fora do ar: {adiados} alerta(s) adiado(s) p/ a próxima volta")
 
         ultimo_processamento = datetime.now(FUSO).isoformat(timespec="seconds")
         logger.info(f"Avaliados {len(itens)} anúncios")

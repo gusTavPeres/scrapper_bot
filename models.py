@@ -96,7 +96,7 @@ class _Validacoes(BaseModel):
     def _termo_identifica(cls, v):
         # "F", "T", "Lu" casam com tudo na OLX (1.250 anúncios cada): o termo
         # precisa de uma palavra de 3+ letras ou um modelo com número (ps5, s23)
-        if v and not re.search(r"[^\W_]{3,}|(?=\w*\d)[^\W_]{2,}", v):
+        if v and not re.search(r"[^\W_]{3,}|(?=\w*\d)[^\W_]{2,}", v) and len(re.findall(r"[^\W_]{2,}", v)) < 2:
             raise ValueError("termo genérico demais — use ao menos uma palavra de 3 letras ou o modelo")
         return v
 
@@ -120,7 +120,9 @@ class _Validacoes(BaseModel):
             except ValueError:
                 v = v.split(",")
         if isinstance(v, list):
-            return [str(x).strip() for x in v if str(x).strip()]
+            v = [str(x).strip() for x in v if str(x).strip()]
+            if any(len(x) > 200 for x in v):
+                raise ValueError("cada item tem no máximo 200 caracteres")
         return v
 
     @field_validator("filtros_extra", mode="before", check_fields=False)
@@ -132,11 +134,22 @@ class _Validacoes(BaseModel):
             v = json.loads(v or "{}")
         if not isinstance(v, dict) or set(v) - {"ano_min", "ano_max", "km_max", "motor"}:
             raise ValueError("filtros_extra aceita só ano_min, ano_max, km_max, motor")
+        v = dict(v)
+        # número vindo como texto ("2011") era gravado como texto e todo scan
+        # quebrava comparando int com str: a busca ficava em erro p/ sempre
+        for k in ("ano_min", "ano_max", "km_max"):
+            if k in v:
+                try:
+                    v[k] = int(v[k])
+                except (TypeError, ValueError, OverflowError):
+                    raise ValueError(f"{k} deve ser um número inteiro") from None
         for k in ("ano_min", "ano_max"):
-            if k in v and not 1950 <= int(v[k]) <= 2100:
+            if k in v and not 1950 <= v[k] <= 2100:
                 raise ValueError(f"{k} fora de 1950-2100")
-        if "km_max" in v and int(v["km_max"]) < 0:
-            raise ValueError("km_max negativo")
+        if v.get("ano_min") and v.get("ano_max") and v["ano_min"] > v["ano_max"]:
+            raise ValueError("ano_min maior que ano_max")
+        if "km_max" in v and not 0 <= v["km_max"] <= 10_000_000:
+            raise ValueError("km_max fora de 0-10.000.000")
         if "motor" in v and not re.fullmatch(r"\d\.\d", str(v["motor"])):
             raise ValueError("motor deve ser como 1.8")
         return v
@@ -164,12 +177,16 @@ class BuscaCreate(_Validacoes):
     def _coerencia(self):
         # "/add rtx 3090 com defeito" sem condicao= explícita: deduz a intenção
         # (negado não conta: critério "sem defeito" é o contrário de pedir defeito)
-        pedido = re.sub(r"\b(sem|nao|nunca|nenhuma?)\s+\w+", " ",
-                        _sem_acento(f"{self.termo} {' '.join(self.criterios_inclusao)}"))
+        # negação vale até o fim da oração: "sem nenhum defeito", "nunca foi quebrado"
+        pedido = re.sub(r"\b(?:sem|nao|nunca|nenhuma?|nada de)\b.*?(?=\bcom\b|[,;.]|$)", " ",
+                        _sem_acento(f"{self.termo}. {'. '.join(self.criterios_inclusao)}"))
         if "condicao" not in self.model_fields_set and _RE_QUER_DEFEITO.search(pedido):
             self.condicao = "defeito"
         if not self.termo and self.tipo != "carro":
             raise ValueError("termo obrigatório (só carro aceita busca sem modelo)")
+        if not self.termo and not (self.filtros_extra or self.preco_min or self.preco_max):
+            # mesma regra do /addcarro: "todos os carros do Brasil" sem filtro nenhum não
+            raise ValueError("busca de carros sem modelo exige ao menos um filtro (ano, km, motor ou preço)")
         if self.preco_min and self.preco_max and self.preco_min > self.preco_max:
             raise ValueError("preco_min maior que preco_max")
         return self
