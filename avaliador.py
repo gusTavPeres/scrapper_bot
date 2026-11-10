@@ -317,6 +317,19 @@ def produto_bate(termo: str, titulo: str) -> tuple[bool, str]:
     # busca de máquina inteira ("notebook dell", "pc gamer"): o processador
     # descreve o próprio produto, não é montagem
     sistema = re.search(r"(?<![a-z0-9])(notebook|laptop|computador|pc|workstation|servidor)(?![a-z0-9])", t)
+    # "i7 8700 + RTX 3060 + 16GB + SSD": peças somadas com "+" = PC montado (2+ "+"
+    # com outra peça depois; "RTX 3090 + caixa" ou "iPhone 13 + capinha" não)
+    pecas = r"(rtx|gtx|rx|arc|ryzen|xeon|core|i[3579]|ram|ssd|nvme|fonte|placa mae|gabinete|monitor|\d+\s?gb)"
+    if not sistema and len(re.findall(rf"[+|–-]\s*(?:intel\s+|amd\s+|nvidia\s+)?{pecas}\b", ti)) >= 2:
+        return False, "anúncio é de pc montado (peças somadas), não da peça avulsa buscada"
+    # processador avulso x o que vem junto: "placa-mãe Z370 + i7 8700" é kit; "Dell
+    # XPS 8700 Core i7" e "Dell Vostro 3470 i7 8700" são máquinas de marca
+    if re.search(r"\b(?:core\s+)?i[3579]\b", t) and not sistema:
+        if re.search(r"\bplaca[\s-]*mae\b", ti) and "placa mae" not in t:
+            return False, "anúncio é de kit (placa-mãe + processador), não do processador avulso"
+        if re.search(r"\b(?:dell|hp|lenovo|acer|asus|samsung|positivo|vostro|xps|optiplex|inspiron|"
+                     r"latitude|thinkpad|ideapad|elitedesk|prodesk|aspire|vivobook|zenbook)\b", ti):
+            return False, "anúncio é de máquina de marca, não do processador avulso"
     for pal in _CONJUNTOS:
         if re.search(rf"(?<![a-z0-9]){pal}(?![a-z0-9])", t) or (sistema and pal in _PROCESSADORES):
             continue
