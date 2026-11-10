@@ -1075,10 +1075,17 @@ async def processar_fila(notifier=None):
                             "score": av["score"]})
             await asyncio.sleep(0)
 
-        adiados = 0
+        adiados, enviados_agora = 0, {}
+        # mesmo bairro + mesmo preço + mesmo termo, na MESMA leva: um vendedor com 7
+        # anúncios iguais ("Rtx 3060 12gb Msi/Colorful/..." a 1.289, descrição copiada
+        # = loja disfarçada ou golpe em série) rendeu 5 alertas numa rodada. A
+        # republicação só via os já gravados; aqui vale o que acabou de sair
+        chave = lambda it: (it.get("termo"), it.get("local"), round(it.get("preco") or 0))
         for item, av in sorted(alertas, key=lambda x: -x[1]["score"]):     # os melhores primeiro
             r = por_busca[item["busca_id"]]
             orig, certa = republicacao(item)
+            if not certa and chave(item) in enviados_agora and item.get("local"):
+                orig, certa = enviados_agora[chave(item)], True
             if orig and not certa:
                 av = {**av, "observacoes": ["Mesmo bairro e preço de um anúncio enviado há menos de "
                                             "24 h: pode ser o mesmo vendedor reanunciando"] + av["observacoes"]}
@@ -1090,6 +1097,7 @@ async def processar_fila(notifier=None):
                 r["sem_alerta"] += 1
             elif not adiados and await notifier.enviar_resultado(item, av):
                 r["alertas"] += 1
+                enviados_agora.setdefault(chave(item), item["anuncio_id"])
                 db.marcar_notificado(item["anuncio_id"])
                 logger.info(f"alerta {av['alerta']} enviado: [{item.get('nome')}] "
                             f"{(item.get('titulo') or '')[:50]} R$ {item.get('preco') or 0:.0f}")

@@ -2820,6 +2820,28 @@ def test_p12_avaliador_revisao():
     assert not falhas, falhas
 
 
+def test_p12_vendedor_em_serie_na_mesma_leva():
+    """Um vendedor com vários anúncios iguais (mesmo bairro e preço, títulos
+    variando a marca) na MESMA rodada rendia um alerta por anúncio: a
+    republicação só olhava os já gravados como notificados. Outro bairro ou
+    outro preço na mesma leva seguem alertando."""
+    novo_banco()
+    bid = criar(termo="rtx 3060", preco_max=1500)
+    sql("UPDATE buscas SET criado_em=datetime('now','-3 days')")
+    def anuncio(titulo, preco=1289, local="Cidade E, Bairro 5"):
+        aid, _, _ = db.upsert_anuncio(bid, {"url": f"https://x/a-{abs(hash(titulo)) % 10**7}", "titulo": titulo,
+                                            "preco": preco, "local": local})
+        db.atualizar_descricao(aid, bid, _item()["descricao"])
+        return aid
+    serie = [anuncio(f"Rtx 3060 12gb {m}") for m in ("Msi", "Colorful", "Galax", "")]
+    outros = [anuncio("Rtx 3060 12gb Asus", local="Cidade F, Bairro 6"), anuncio("Rtx 3060 12gb Zotac", preco=1350)]
+    n = NotifierFalso()
+    rodar(avaliador.processar_fila(n))
+    assert len([a for a in n.enviados if a in serie]) == 1, n.enviados
+    assert all(o in n.enviados for o in outros), n.enviados
+    assert all(sql("SELECT notificado FROM anuncios WHERE id=?", a)[0][0] for a in serie)   # não voltam depois
+
+
 def test_p11_pausa_apos_bloqueio():
     """403/429: TODAS as buscas esperam 15 min (senão cada uma bate no bloqueio
     por conta própria). Layout mudado não pausa."""
