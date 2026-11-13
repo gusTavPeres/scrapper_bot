@@ -698,6 +698,29 @@ def reavaliar_cep(busca_id: int, cep: str):
                      "SELECT id, busca_id, -1 FROM anuncios WHERE busca_id=? AND cep=?", (busca_id, cep))
 
 
+def salvar_coords_lote(linhas: list[tuple]):
+    """[(chave, lat, lon)] numa transação; não troca coordenada que já existe."""
+    with get_conn() as conn:
+        conn.executemany("""INSERT INTO locais (chave, lat, lon) VALUES (?, ?, ?)
+                            ON CONFLICT(chave) DO UPDATE SET lat=excluded.lat, lon=excluded.lon
+                            WHERE locais.lat IS NULL AND excluded.lat IS NOT NULL""", linhas)
+
+
+def nomes_locais(prefixo: str) -> list[str]:
+    """Nomes guardados sob um prefixo ('go|cidade|' = bairros; 'mun:go|' = municípios)."""
+    with get_conn() as conn:
+        return [r[0] for r in conn.execute("SELECT substr(chave, ?) FROM locais WHERE chave >= ? AND chave < ?",
+                                           (len(prefixo) + 1, prefixo, prefixo + "\uffff"))]
+
+
+def reavaliar_imoveis():
+    """Em silêncio, todas as buscas de imóvel (o cadastro de uma cidade serve a todas as dela)."""
+    with get_conn() as conn:
+        conn.execute("INSERT OR IGNORE INTO fila (anuncio_id, busca_id, prioridade) "
+                     "SELECT a.id, a.busca_id, -1 FROM anuncios a JOIN buscas b ON b.id = a.busca_id "
+                     "WHERE b.tipo = 'imovel'")
+
+
 def coords_vizinhas(cep: str):
     """Centro dos CEPs já localizados com os mesmos 5 primeiros dígitos (None se nenhum)."""
     with get_conn() as conn:

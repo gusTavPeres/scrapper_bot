@@ -135,6 +135,16 @@ class _SemRede:
 scheduler._sessao = _SemRede
 
 
+def _sem_rede_real(*a, **k):
+    raise RuntimeError("teste tentou usar a rede real (IBGE/mapa/CEP)")
+
+
+# IBGE, mapa e serviço de CEP usam `requests` direto: sem isto um teste de imóvel ia à internet
+scheduler_ibge_real = scheduler._carregar_ibge_sinc
+scheduler._carregar_ibge_sinc = lambda uf, cidade: []
+scheduler._geocodificar_sinc = scheduler._geocodificar_cep_sinc = _sem_rede_real
+
+
 # ═══ PARTE 1 — RASPAGEM ═══════════════════════════════════
 
 def test_p1_flight_dos_scripts():
@@ -3572,6 +3582,116 @@ def test_p13_coluna_nova_em_banco_ja_migrado():
     assert db.obter_fila_pendente()[0]["cep"] == "74000001"
 
 
+def test_p13_texto_diz_outro_lugar():
+    """O local do anúncio vem do CEP digitado; quando título/descrição dizem outra
+    cidade o anúncio sai, e quando dizem outro bairro a distância conta o mais longe."""
+    novo_banco()
+    db.salvar_coords_lote([("mun:go|cidade alfa", None, None), ("mun:go|vizinha do sul", None, None),
+                           ("mun:go|um", None, None), ("mun:go|goias", None, None),
+                           ("go|cidade alfa|bairro um", -10.01, -50.0), ("go|cidade alfa|setor longe", -10.2, -50.0),
+                           ("go|cidade alfa|jardim goias", -10.02, -50.0), ("go|cidade alfa|setor central", -10.0, -50.0),
+                           ("go|cidade alfa|centro", -10.0, -50.0), ("go|cidade alfa|vila osvaldo", -10.0, -50.0),
+                           ("go|cidade alfa|campos", -10.0, -50.0)])
+    avaliador._nomes_cache.clear()
+    b = {"tipo": "imovel", "estado": "go", "termo": "", "filtros_extra": {"cidade": "Cidade Alfa", "centro": [-10.0, -50.0], "raio_km": 8}}
+    cit = lambda titulo, desc="", local="Cidade Alfa, Bairro Um": avaliador.local_citado(
+        b, {**_ap(titulo=titulo, local=local), "descricao": desc})
+    # outra cidade: no título depois de "em"/"-", ou em qualquer parte seguida da UF
+    assert cit("Kitnet mobiliada em Vizinha do Sul") == ("cidade", "vizinha do sul")
+    assert cit("Alugo casa no Pontal-VIZINHA DO SUL") == ("cidade", "vizinha do sul")
+    assert cit("Apartamento 2 quartos", "Rua 1, Setor X, Vizinha do Sul - GO. Ótima localização.") == ("cidade", "vizinha do sul")
+    for titulo, desc in (("Casa em Cidade Alfa - Goiás, Bairro Um", ""),                   # o estado não é outra cidade
+                         ("Apartamento no Jardim Goiás", ""), ("Casa", "Fácil acesso à saída para Vizinha do Sul."),
+                         ("Casa próximo a Vizinha do Sul", ""), ("Casa na Avenida Vizinha do Sul", ""),
+                         ("Apartamento Bairro Um", "A 10 min de Vizinha do Sul.")):
+        assert cit(titulo, desc, "Cidade Alfa, Jardim Goiás" if "Jardim" in titulo else "Cidade Alfa, Bairro Um") is None \
+            or cit(titulo, desc)[0] != "cidade", (titulo, desc, cit(titulo, desc))
+    ex = avaliador.triagem(b, {**_ap(titulo="Kitnet em Vizinha do Sul"), "descricao": ""})
+    assert ex == (False, "o texto diz que fica em Vizinha Do Sul, não em Cidade Alfa"), ex
+    # outro bairro
+    assert cit("Apartamento no Setor Longe") == ("bairro", "setor longe")
+    assert cit("Apartamento 2 quartos", "Imóvel localizado no Setor Longe, perto de tudo.") == ("bairro", "setor longe")
+    for titulo, desc, local in (("Apartamento Bairro Um, ao lado do Setor Longe", "", "Cidade Alfa, Bairro Um"),   # cita o próprio
+                                ("Apartamento próximo ao Setor Longe", "", "Cidade Alfa, Bairro Um"),
+                                ("Apartamento", "Perto do Setor Longe e do shopping.", "Cidade Alfa, Bairro Um"),
+                                ("Casa no Centro", "", "Cidade Alfa, Setor Central"),
+                                ("Apto Vila Oswaldo", "", "Cidade Alfa, Vila Osvaldo"),
+                                ("Kitnet no Campos Residence", "", "Cidade Alfa, Bairro Um")):
+        assert cit(titulo, desc, local) is None, (titulo, cit(titulo, desc, local))
+    # a distância conta o mais longe dos dois, e a avaliação avisa
+    a = {**_ap(titulo="Apartamento no Setor Longe"), "descricao": "Dois quartos, sala e cozinha, com garagem coberta e portão eletrônico."}
+    assert round(avaliador.distancia_km(b, a)) == 22 and "raio de 8 km" in avaliador.passa_filtros_imovel(b, a)[1]
+    perto = {**_ap(titulo="Apartamento no Jardim Goiás"), "descricao": a["descricao"]}
+    av = avaliar({**b, "anuncio_id": 1, "busca_id": 1, "instrucoes": "", "criterios_inclusao": [], "criterios_exclusao": [],
+                  "preco_max": 3000, **perto}, [])
+    assert av["decisao"] == "APROVADO" and any("o texto cita Jardim Goias" in o for o in av["observacoes"]), av
+    assert "a ~2,2 km" in " ".join(av["pros"])
+    # sem as listas carregadas (cidade sem cadastro), nada é inventado
+    novo_banco()
+    avaliador._nomes_cache.clear()
+    assert cit("Kitnet em Vizinha do Sul") is None and cit("Apartamento no Setor Longe") is None
+    avaliador._nomes_cache.clear()
+
+
+def test_p13_cadastro_do_ibge():
+    """Municípios do estado + CEPs e localidades da cidade vêm do IBGE 1x (marcador
+    no banco); falha de rede tenta de novo; a busca é reavaliada com os dados novos."""
+    import csv, io, zipfile
+    novo_banco()
+    bid = db.criar_busca({"nome": "ap", "tipo": "imovel", "termo": "", "estado": "go",
+                          "filtros_extra": {"cidade": "Cidade Alfa", "centro": [-10.0, -50.0], "raio_km": 8}})
+    aid, _, _ = db.upsert_anuncio(bid, _ap(lid=1))
+    sql("DELETE FROM fila")
+    chamadas = []
+    def fora(uf, cidade):
+        chamadas.append((uf, cidade))
+        raise OSError("sem rede")
+    scheduler._carregar_ibge_sinc = fora
+    rodar(scheduler._carregar_ibge(db.obter_busca(bid)))
+    assert chamadas == [("go", "Cidade Alfa")] and not sql("SELECT 1 FROM locais")
+    _erros_de_log.clear()
+    def ibge(uf, cidade):
+        chamadas.append((uf, cidade))
+        return [("mun:go|cidade alfa", None, None), ("cep:74000001", -10.01, -50.0), ("go|cidade alfa|bairro um", -10.02, -50.0)]
+    scheduler._carregar_ibge_sinc = ibge
+    db.salvar_coords("go|cidade alfa|bairro um", None, None)          # o mapa não conhecia: o IBGE preenche
+    rodar(scheduler._carregar_ibge(db.obter_busca(bid)))
+    rodar(scheduler._carregar_ibge(db.obter_busca(bid)))                # já carregado: não repete
+    assert len(chamadas) == 2 and db.coords_local("cep:74000001") == (-10.01, -50.0)
+    assert db.coords_local("go|cidade alfa|bairro um") == (-10.02, -50.0)
+    assert sql("SELECT prioridade FROM fila WHERE anuncio_id=?", aid)[0][0] == -1     # reavalia em silêncio
+    assert round(avaliador.distancia_km(db.obter_busca(bid), {**_ap(lid=1), "cep": "74000001"}), 1) == 1.1
+    # leitura do zip do cadastro (formato real: ; e as colunas CEP, DSC_LOCALIDADE, LATITUDE, LONGITUDE)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("123_CIDADE.csv", "COD;CEP;DSC_LOCALIDADE;LATITUDE;LONGITUDE\n1;74000001;BAIRRO UM;-10.0;-50.0\n"
+                                     "2;74000001;BAIRRO UM;-10.2;-50.2\n3;74000002;SETOR ÁGUA;-11.0;-51.0\n4;74000003;X;;\n")
+    class R:
+        def __init__(self, corpo=b"", js=None, texto=""):
+            self.content, self._js, self.text, self.headers = corpo, js, texto, {"content-length": str(len(corpo))}
+        def json(self): return self._js
+        def raise_for_status(self): pass
+        def iter_content(self, n): yield self.content
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+    import requests
+    pedidos = []
+    def get(url, **kw):
+        pedidos.append(url)
+        if "localidades" in url:
+            return R(js=[{"id": 5200001, "nome": "Cidade Alfa"}, {"id": 5200002, "nome": "Vizinha do Sul"}])
+        return R(buf.getvalue()) if url.endswith(".zip") else R(texto='<a href="5200001_CIDADE_ALFA.zip">x</a>')
+    orig, requests.get = requests.get, get
+    try:
+        linhas = dict((k, (la, lo)) for k, la, lo in scheduler_ibge_real("go", "cidade alfa"))
+    finally:
+        requests.get = orig
+    assert pedidos[1].endswith("/52_GO/") and pedidos[2].endswith("/52_GO/5200001_CIDADE_ALFA.zip"), pedidos
+    assert linhas["mun:go|vizinha do sul"] == (None, None) and linhas["cep:74000002"] == (-11.0, -51.0)
+    assert [round(x, 3) for x in linhas["cep:74000001"]] == [-10.1, -50.1] and "go|cidade alfa|setor agua" in linhas
+    assert "cep:74000003" not in linhas
+
+
 if __name__ == "__main__":
     import sys
     testes = [(n, f) for n, f in list(globals().items()) if n.startswith("test_")]
@@ -3582,7 +3702,8 @@ if __name__ == "__main__":
             continue
         estado = [(m, k, getattr(m, k)) for m, ks in (
             (scheduler, ("raspar_busca", "_preencher_descricoes", "_sessao", "processar_busca",
-                        "_olx_falha_desde", "_olx_alertado", "_olx_pausa_ate", "_canario_proximo")),
+                        "_olx_falha_desde", "_olx_alertado", "_olx_pausa_ate", "_canario_proximo",
+                        "_carregar_ibge_sinc", "_geocodificar_sinc", "_geocodificar_cep_sinc")),
             (notifier, ("alertar", "enviar_queda", "_post", "_enviar", "TOKEN")),
             (tb, ("_enviar", "_post", "TOKEN", "CHAT_ID"))) for k in ks]
         try:

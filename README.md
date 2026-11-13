@@ -37,8 +37,13 @@ navegador) e avisa no Telegram quando aparece uma oportunidade.
   mês** (aluguel + condomínio + IPTU; IPTU anual digitado no campo mensal é
   dividido por 12, "condomínio incluso" é lido da descrição). Cada anúncio é
   comparado com os outros que cabem no mesmo filtro: mesmo bairro, nº de quartos
-  e tamanho parecido. `perto=latitude,longitude raio=8` limita a um raio (pelo
-  CEP da página do anúncio; sem ele, pelo centro do bairro no OpenStreetMap).
+  e tamanho parecido. `perto=latitude,longitude raio=8` limita a um raio, medido pelo CEP da
+  página do anúncio. As coordenadas de cada CEP e bairro vêm do cadastro de
+  endereços do Censo 2022 do IBGE (1 arquivo por cidade, baixado 1x; um serviço
+  de CEP e o OpenStreetMap cobrem o que faltar). Como o local do anúncio é só o
+  CEP que o anunciante digitou, o bot confere com o texto: se título ou
+  descrição dizem outra cidade o anúncio sai, e se citam outro bairro a
+  distância conta o mais longe dos dois e o alerta avisa.
   O estoque do 1º scan não vira alerta (fica no `/top`): só o que for anunciado
   depois. A nota mede o quanto a moradia vale dentro do filtro, não só o preço:
   distância do ponto de referência, posição de preço e custo por m² entre os
@@ -110,6 +115,6 @@ para aceitar só conexões da própria máquina). Segredos ficam só no `.env`
 ## Testes
 
 ```bash
-./venv/bin/python test_offline.py      # 101 testes de regressão (não usam rede nem o banco real)
+./venv/bin/python test_offline.py      # 103 testes de regressão (não usam rede nem o banco real)
 ./venv/bin/python test_live_olx.py     # canário contra a OLX real (layout, RSC, ordem, aluguel)
 ```

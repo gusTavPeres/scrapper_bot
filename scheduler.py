@@ -485,6 +485,80 @@ async def _geocodificar_cep(busca: dict, cep: str):
         db.salvar_coords(f"cep:{cep}", None, None)
 
 
+IBGE_MUNICIPIOS = "https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
+IBGE_ENDERECOS = ("https://ftp.ibge.gov.br/Cadastro_Nacional_de_Enderecos_para_Fins_Estatisticos/"
+                  "Censo_Demografico_2022/Arquivos_CNEFE/CSV/Municipio/")
+IBGE_MAX_MB = 250          # zip da cidade (uma capital média tem ~20 MB)
+
+
+def _carregar_ibge_sinc(uf: str, cidade: str) -> list[tuple]:
+    """Do IBGE, sem limite de consultas: os municípios do estado e, do cadastro de
+    endereços do Censo 2022 da cidade (1 zip, lido em fluxo e apagado), o centro de
+    cada CEP e de cada localidade (bairro). -> [(chave, lat, lon)] p/ a tabela
+    `locais`. Numa capital: ~780 mil endereços -> ~13 mil CEPs, em ~3 s."""
+    import csv
+    import io
+    import tempfile
+    import zipfile
+    import requests
+    ua = {"User-Agent": "monitor-olx/1.0"}
+    muns = requests.get(IBGE_MUNICIPIOS.format(uf=uf.upper()), headers=ua, timeout=30).json()
+    linhas = [(f"mun:{uf}|{avaliador.norm(m['nome'])}", None, None) for m in muns]
+    alvo = next((m for m in muns if avaliador._palavras(m["nome"]) == avaliador._palavras(cidade)), None)
+    if not alvo:
+        return linhas
+    pasta = f"{IBGE_ENDERECOS}{str(alvo['id'])[:2]}_{uf.upper()}/"
+    m = re.search(rf'href="({alvo["id"]}_[^"]+\.zip)"', requests.get(pasta, headers=ua, timeout=30).text)
+    if not m:
+        return linhas
+    ceps, locais = {}, {}
+    with tempfile.TemporaryFile() as tmp:
+        with requests.get(pasta + m.group(1), headers=ua, timeout=120, stream=True) as r:
+            r.raise_for_status()
+            if int(r.headers.get("content-length") or 0) > IBGE_MAX_MB << 20:
+                logger.info(f"cadastro de endereços de {cidade} grande demais: fica o serviço de CEP")
+                return linhas
+            for bloco in r.iter_content(1 << 20):
+                tmp.write(bloco)
+        with zipfile.ZipFile(tmp) as z, z.open(z.namelist()[0]) as f:
+            leitor = csv.reader(io.TextIOWrapper(f, encoding="utf-8"), delimiter=";")
+            cab = next(leitor)
+            ic, il, ila, ilo = (cab.index(k) for k in ("CEP", "DSC_LOCALIDADE", "LATITUDE", "LONGITUDE"))
+            for linha in leitor:
+                try:
+                    lat, lon = float(linha[ila]), float(linha[ilo])
+                except (ValueError, IndexError):
+                    continue
+                for d, k in ((ceps, linha[ic]), (locais, avaliador.norm(linha[il]).strip())):
+                    if k:
+                        v = d.setdefault(k, [0.0, 0.0, 0])
+                        v[0] += lat; v[1] += lon; v[2] += 1
+    cid = avaliador.norm(alvo["nome"]).strip()
+    linhas += [(f"cep:{k}", v[0] / v[2], v[1] / v[2]) for k, v in ceps.items() if re.fullmatch(r"\d{8}", k)]
+    linhas += [(f"{uf}|{cid}|{k}", v[0] / v[2], v[1] / v[2]) for k, v in locais.items()]
+    return linhas
+
+
+async def _carregar_ibge(busca: dict):
+    """1x por cidade (marcador em `locais`); falha de rede tenta de novo na próxima rodada."""
+    uf, cidade = avaliador.norm(busca.get("estado")), avaliador._extras(busca).get("cidade")
+    if not cidade or uf in ("", "brasil"):
+        return
+    marca = f"ibge:{uf}|{avaliador._palavras(cidade)}"
+    if db.coords_local(marca) is not None:
+        return
+    try:
+        linhas = await asyncio.to_thread(_carregar_ibge_sinc, uf, cidade)
+    except Exception as e:
+        logger.warning(f"cadastro de endereços do IBGE ({cidade}): {e!r}")
+        return
+    db.salvar_coords_lote(linhas + [(marca, 1.0, 1.0)])
+    db.reavaliar_imoveis()
+    avaliador._nomes_cache.clear()
+    logger.info(f"IBGE: {sum(1 for l in linhas if l[0].startswith('cep:'))} CEPs e "
+                f"{sum(1 for l in linhas if l[0].count('|') == 2)} localidades de {cidade} guardados")
+
+
 async def _geocodificar(busca: dict, ads: list[dict]):
     """Busca com raio: acha (1x, guardado p/ sempre) o centro de cada bairro novo
     no OpenStreetMap — 1 consulta por segundo, como o serviço pede. Resultado a
@@ -492,7 +566,10 @@ async def _geocodificar(busca: dict, ads: list[dict]):
     não achado. Falha de rede não grava nada (tenta na próxima rodada) e o
     anúncio passa sem a distância."""
     extras = avaliador._extras(busca)
-    if busca.get("tipo") != "imovel" or not extras.get("centro"):
+    if busca.get("tipo") != "imovel":
+        return
+    await _carregar_ibge(busca)          # também sem raio: é quem diz se o texto cita outro lugar
+    if not extras.get("centro"):
         return
     uf = busca.get("estado") or ""
     for chave in dict.fromkeys(avaliador.chave_local(uf, a) for a in ads):

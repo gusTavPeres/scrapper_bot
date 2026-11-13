@@ -893,11 +893,106 @@ def chave_local(estado: str, a: dict) -> str:
     return f"{norm(estado)}|{im['cidade']}|{im['bairro']}" if im["cidade"] and im["bairro"] else ""
 
 
+# ── o texto diz outro lugar que o cadastro ────────────────
+# O local do anúncio vem do CEP que o anunciante digitou. Título e descrição às
+# vezes dizem outra coisa: imóvel de outra cidade cadastrado na capital, ou
+# "Setor A" no título com o cadastro no Setor B. Os nomes vêm do IBGE (municípios
+# do estado e localidades da cidade), carregados 1x pelo scheduler.
+_PREFIXO_LUGAR = ("setor ", "jardim ", "vila ", "parque ", "residencial ", "conjunto ", "bairro ")
+# o nome vem depois de rua/prédio/"perto de": é referência, não o endereço
+_ANTES_REFERENCIA = re.compile(
+    r"\b(?:condominio|cond|edificio|ed|ville|av|avenida|rua|alameda|rodovia|br|prox|proximo|proxima|perto|"
+    r"lado|frente|sentido|saida|acesso|divisa|shopping|faculdade|colegio|escola|hospital|terminal|praca|pca|"
+    r"regiao)\b[\s.]*(?:(?:a|ao|aos|as|de|do|da|com|para|pra|o)\s+)?$")
+_ANTES_LUGAR = re.compile(r"(?:\b(?:no|na|em|bairro)\s+|[-,/|:(]\s*)$")
+_ANTES_ENDERECO = re.compile(r"\b(?:localizad[oa]|situad[oa]|fica|endereco|bairro)\b[^.\n]{0,40}$")
+_nomes_cache: dict[str, tuple[float, object]] = {}
+
+
+def _regex_nomes(chave: str, carregar):
+    """Regex de uma lista de nomes (5+ letras), refeito a cada 5 min. None se vazia."""
+    import time
+    agora = time.monotonic()
+    if chave not in _nomes_cache or agora - _nomes_cache[chave][0] > 300:
+        nomes = sorted({n for n in carregar() if len(n) >= 5}, key=len, reverse=True)
+        rx = re.compile(r"(?<![a-z0-9])(" + "|".join(map(re.escape, nomes)) + r")(?![a-z0-9])") if nomes else None
+        _nomes_cache[chave] = (agora, rx)
+    return _nomes_cache[chave][1]
+
+
+def _outras_cidades(uf: str, cidade: str) -> list[str]:
+    """Municípios do estado, menos a própria cidade e os que são pedaço de nome de
+    bairro dela ("Goiás" x "Jardim Goiás", "Jaraguá" x "Vila Jaraguá"). Sem a
+    lista de bairros carregada não dá p/ separar: devolve vazio."""
+    bairros = db.nomes_locais(f"{uf}|{cidade}|")
+    return [n for n in db.nomes_locais(f"mun:{uf}|")
+            if n != cidade and not any(n in b for b in bairros)] if bairros else []
+
+
+def _mesmo_bairro(x: str, y: str) -> bool:
+    """"Vila Nova" x "Setor Leste Vila Nova", "Centro" x "Central", "Osvaldo" x "Oswaldo"."""
+    import difflib
+    return (x in y or y in x or (len(x) >= 5 and x[:5] == y[:5])
+            or difflib.SequenceMatcher(None, x, y).ratio() >= 0.8)
+
+
+def local_citado(busca: dict, a: dict):
+    """('cidade'|'bairro', nome) quando o texto do anúncio diz que o imóvel fica em
+    OUTRO lugar que o do cadastro; None se confere ou não dá p/ saber.
+    Cidade: no título, depois de "em"/"-"/","; em qualquer parte, seguida da UF
+    ("Cidade Vizinha - UF"). Bairro: no título (nome com cara de bairro ou depois de
+    "no"/"-"), ou na descrição depois de "localizado/situado/bairro". Não conta o
+    que vem depois de rua, prédio ou "próximo a", nem quando o texto também cita o
+    bairro do cadastro (aí é só vizinhança)."""
+    if "_local_citado" in a:
+        return a["_local_citado"]
+    uf, im = norm(busca.get("estado")), dados_imovel(a)
+    titulo, desc = norm(a.get("titulo")), norm(a.get("descricao"))
+    achado = None
+    if im["cidade"] and uf:
+        pre_b = f"{uf}|{im['cidade']}|"
+        rx_mun = _regex_nomes(f"mun:{uf}|~{im['cidade']}", lambda: _outras_cidades(uf, im["cidade"]))
+        for texto, so_com_uf in ((titulo, False), (desc, True)) if rx_mun else ():
+            for m in rx_mun.finditer(texto):
+                antes = texto[max(0, m.start() - 30):m.start()]
+                if m.group(1) == im["cidade"] or _ANTES_REFERENCIA.search(antes) or antes.rstrip(" -,/").endswith(im["cidade"]):
+                    continue
+                com_uf = re.match(rf"\s*[-/,(]?\s*{uf}\b", texto[m.end():m.end() + 8])
+                if com_uf or (not so_com_uf and _ANTES_LUGAR.search(antes)):
+                    achado = ("cidade", m.group(1))
+                    break
+            if achado:
+                break
+        rx_b = _regex_nomes(pre_b, lambda: db.nomes_locais(pre_b))
+        meu = _palavras(im["bairro"])
+        nucleo = lambda n: next((n[len(p):] for p in _PREFIXO_LUGAR if n.startswith(p)), n)
+        if not achado and rx_b and meu and nucleo(meu) not in _palavras(titulo + " " + desc):
+            for texto, na_descricao in ((titulo, False), (desc, True)):
+                for m in rx_b.finditer(texto):
+                    nome, antes = m.group(1), texto[max(0, m.start() - 45):m.start()]
+                    if _mesmo_bairro(nucleo(_palavras(nome)), nucleo(meu)) or _ANTES_REFERENCIA.search(antes) \
+                            or re.match(r"\s+(?:residence|residencial|park|tower|home|life|flat|club)\b", texto[m.end():]):
+                        continue           # "Centro Residence" é o prédio, não o bairro
+                    if (_ANTES_ENDERECO.search(antes) if na_descricao
+                            else nome.startswith(_PREFIXO_LUGAR) or _ANTES_LUGAR.search(antes)):
+                        achado = ("bairro", nome)
+                        break
+                if achado:
+                    break
+    a["_local_citado"] = achado
+    return achado
+
+
+def _km(p, q) -> float:
+    import math
+    x = math.radians(q[1] - p[1]) * math.cos(math.radians((p[0] + q[0]) / 2))
+    return 6371 * math.hypot(x, math.radians(q[0] - p[0]))
+
+
 def distancia_km(busca: dict, a: dict):
     """Do anúncio ao ponto de referência da busca: pelo CEP (precisão de rua) quando
     a página do anúncio já foi lida, senão pelo centro do bairro (1-2 km de erro).
     None = sem ponto de referência ou local que o mapa não conhece."""
-    import math
     centro, chave = _extras(busca).get("centro"), chave_local(busca.get("estado") or "", a)
     if not centro:
         return None
@@ -909,11 +1004,14 @@ def distancia_km(busca: dict, a: dict):
         c = db.coords_vizinhas(a["cep"])
     if not c or c[0] is None:
         c = db.coords_local(chave) if chave else None
-    if not c or c[0] is None:
-        return None
-    (la1, lo1), (la2, lo2) = centro, c
-    x = math.radians(lo2 - lo1) * math.cos(math.radians((la1 + la2) / 2))
-    return 6371 * math.hypot(x, math.radians(la2 - la1))
+    d = _km(centro, c) if c and c[0] is not None else None
+    # o texto cita OUTRO bairro: não dá p/ saber qual vale — conta o mais distante
+    if (cit := local_citado(busca, a)) and cit[0] == "bairro":
+        im = dados_imovel(a)
+        c2 = db.coords_local(f"{norm(busca.get('estado'))}|{im['cidade']}|{cit[1]}")
+        if c2 and c2[0] is not None:
+            d = max(d or 0, _km(centro, c2))
+    return d
 
 
 def passa_filtros_imovel(busca: dict, a: dict) -> tuple[bool, str]:
@@ -957,6 +1055,8 @@ def triagem_imovel(busca: dict, a: dict) -> tuple[bool, str]:
     ex, ti, termo = _extras(busca), norm(a.get("titulo")), norm(busca.get("termo"))
     veta = lambda rx: (m := rx.search(ti)) and m.group(0).strip() not in termo \
         and afirmado(ti, m.group(1)) is not False
+    if (cit := local_citado(busca, a)) and cit[0] == "cidade":
+        return False, f"o texto diz que fica em {cit[1].title()}, não em {dados_imovel(a)['cidade'].title()}"
     if veta(_RE_PROCURA):
         return False, "anúncio de quem PROCURA imóvel"
     if ex.get("negocio") != "venda" and veta(_RE_TEMPORADA):
@@ -1097,6 +1197,10 @@ def avaliar_imovel(item: dict, texto: str, regras: list, modelo, descartado: str
             sem_distancia = True
             obs.append("Não foi possível medir a distância — confira no mapa")
             motivos.append("distância não confirmada")
+
+    if (cit := local_citado(item, item)) and cit[0] == "bairro":
+        obs.append(f"O cadastro diz {(item.get('local') or '').partition(', ')[2]}, mas o texto cita "
+                   f"{cit[1].title()} — confira o endereço (a distância conta o mais longe dos dois)")
 
     # ── o imóvel ──
     # "sem problemas de infiltração ou mofo": o 2º item da lista herda o "sem"
