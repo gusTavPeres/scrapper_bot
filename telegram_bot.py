@@ -54,10 +54,31 @@ _AJUDA_ADDCARRO = (
     "Ex.: <code>/addcarro linea ano=2011-2016 estado=go</code>"
 )
 
+_AJUDA_ADDALUGUEL = (
+    "🏠 <b>/addaluguel estado=uf cidade=nome [opções]</b> — imóveis para alugar\n"
+    "O teto (<code>max=</code>) vale para o TOTAL do mês: aluguel + condomínio + IPTU. "
+    "Com teto, todo anúncio novo que cabe nos filtros é avisado; o preço é comparado "
+    "com a mediana do mesmo bairro e nº de quartos.\n\n"
+    "<code>estado=sp</code> — obrigatório\n"
+    "<code>cidade=campinas</code> — espaço vira _ (sao_jose_dos_campos)\n"
+    "<code>bairro=centro,cambui</code> — um ou vários, por vírgula\n"
+    "<code>imovel=apartamento|casa|quarto|qualquer</code>\n"
+    "<code>quartos=2</code> · <code>vagas=1</code> · <code>area=50</code> — mínimos\n"
+    "<code>max=2500</code> — teto do total do mês · <code>min=800</code> — aluguel mínimo\n"
+    "<code>vendedor=particular|loja</code> — particular = direto com o dono\n"
+    "<code>negocio=venda</code> — imóveis à venda em vez de aluguel\n"
+    "<code>intervalo=30</code> — minutos entre scans\n"
+    "<code>obs=</code> regras livres: 'só mobiliado', 'sem fiador', 'prefiro varanda'\n"
+    "Palavras soltas viram busca por texto (ex.: <code>kitnet</code>).\n\n"
+    "Ex.: <code>/addaluguel estado=sp cidade=campinas bairro=centro,cambui "
+    "imovel=apartamento quartos=2 vagas=1 max=3000 obs= aceita pet, sem fiador</code>"
+)
+
 _HELP = (
     "🤖 <b>Monitor OLX — comandos</b>\n\n"
     "/add &lt;termo&gt; [opções] — nova busca (envie /add vazio p/ ver opções)\n"
     "/addcarro [modelo] [opções] — busca de carros (ano/km/motor)\n"
+    "/addaluguel estado=uf cidade=nome [opções] — imóveis para alugar\n"
     "/buscas — lista as buscas\n"
     "/top [id] — melhores achados ativos\n"
     "/status — fila e buscas\n"
@@ -136,6 +157,12 @@ def _parse_add(args: list[str], tipo: str = "produto"):
                 extras["km_max"] = _inteiro(v)
             elif k == "motor" and tipo == "carro":
                 extras["motor"] = v
+            elif k in ("cidade", "negocio", "imovel") and tipo == "imovel":
+                extras[k] = v
+            elif k in ("bairro", "bairros") and tipo == "imovel":
+                extras["bairros"] = v.split(",")
+            elif k in ("quartos", "vagas", "area") and tipo == "imovel":
+                extras[f"{k}_min"] = _inteiro(v)
             else:
                 return None, f"Opção desconhecida: <code>{esc(k)}=</code> — veja /help"
         except (ValueError, KeyError):
@@ -202,19 +229,25 @@ def tratar_comando(texto: str) -> str:
                if isinstance(m := b.get("mercado"), dict) and m.get("mediana") else "")
             for b in buscas)
 
-    if cmd in ("add", "addcarro"):
-        tipo = "carro" if cmd == "addcarro" else "produto"
+    if cmd in ("add", "addcarro", "addaluguel", "addimovel"):
+        tipo = {"add": "produto", "addcarro": "carro"}.get(cmd, "imovel")
         if len(partes) == 1:                       # sem argumentos: mostra as opções
-            return _AJUDA_ADDCARRO if tipo == "carro" else _AJUDA_ADD
+            return {"carro": _AJUDA_ADDCARRO, "imovel": _AJUDA_ADDALUGUEL}.get(tipo, _AJUDA_ADD)
         dados, erro = _parse_add(list(partes[1:]), tipo=tipo)
         if erro:
             return erro
         extras = dados["filtros_extra"]
-        if not dados["termo"] and dados["tipo"] != "carro":
+        if dados["tipo"] == "imovel":
+            onde = ", ".join(b for b in extras.get("bairros") or [] if b.strip("_ ")) or extras.get("cidade") or dados.get("estado", "")
+            dados["nome"] = " ".join(x for x in (
+                extras.get("negocio") or "aluguel", extras.get("imovel") or "",
+                f"{extras['quartos_min']}q+" if extras.get("quartos_min") else "",
+                dados["termo"], onde.replace("_", " ")) if x)[:100]
+        elif not dados["termo"] and dados["tipo"] != "carro":
             return _AJUDA_ADD
-        if not dados["termo"] and not (extras or dados.get("preco_min") or dados.get("preco_max")):
+        elif not dados["termo"] and not (extras or dados.get("preco_min") or dados.get("preco_max")):
             return _AJUDA_ADDCARRO           # todos-os-carros exige ao menos 1 filtro
-        if not dados["termo"]:
+        elif not dados["termo"]:
             faixa = f"{dados.get('preco_min', 0) or 0}-{dados.get('preco_max', 0) or '∞'}"
             ano = f" {extras['ano_min']}-{extras['ano_max']}" if extras.get("ano_min") else ""
             dados["nome"] = f"carros {faixa}{ano}"
@@ -230,6 +263,13 @@ def tratar_comando(texto: str) -> str:
             det.append(f"🛣 até {extras['km_max']:,} km".replace(",", "."))
         if extras.get("motor"):
             det.append(f"⚙ motor {extras['motor']}")
+        salvo = db.obter_busca(bid)
+        ex = salvo.get("filtros_extra") or {}
+        if ex.get("cidade"):
+            det.append(f"🏙 {esc(ex['cidade'])}" + (f" ({esc(', '.join(ex['bairros']))})" if ex.get("bairros") else ""))
+        for k, rot in (("quartos_min", "quarto(s)+"), ("vagas_min", "vaga(s)+"), ("area_min", "m²+")):
+            if ex.get(k):
+                det.append(f"{ex[k]} {rot}")
         if dados.get("instrucoes"):
             det.append(f"📝 “{esc(dados['instrucoes'][:40])}”")
         if dados.get("preco_min") or dados.get("preco_max"):
@@ -239,7 +279,8 @@ def tratar_comando(texto: str) -> str:
         for campo, emoji in (("filtro_envio", "📦"), ("filtro_vendedor", "👤"), ("garantia", "🛡")):
             if dados.get(campo):
                 det.append(f"{emoji} {esc(dados[campo])}")
-        det.append(f"🔧 {db.obter_busca(bid)['condicao']}")
+        if dados["tipo"] != "imovel":
+            det.append(f"🔧 {salvo['condicao']}")
         det.append(dados["tipo"])
         return (f"✅ Busca <b>#{bid}</b> criada: “{esc(dados['nome'])}”"
                 f"\n{' · '.join(det)}\nScan começa em ~30 s.")
@@ -353,6 +394,7 @@ async def loop_comandos():
         await asyncio.to_thread(http.post, f"{api}/setMyCommands", json={"commands": [
             {"command": "add", "description": "nova busca — envie vazio p/ ver as opções"},
             {"command": "addcarro", "description": "busca de carros (ano= km= motor=); sem modelo = todos"},
+            {"command": "addaluguel", "description": "imóveis p/ alugar: estado= cidade= bairro= quartos= max="},
             {"command": "buscas", "description": "listar buscas e contadores"},
             {"command": "top", "description": "melhores achados ativos"},
             {"command": "status", "description": "fila e buscas"},

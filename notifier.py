@@ -129,18 +129,24 @@ async def enviar_resultado(anuncio: dict, avaliacao: dict) -> bool:
     """True só se o Telegram aceitou — o chamador marca 'notificado' com isso."""
     rec  = avaliacao.get("recomendacao", "VER")
     pct  = avaliacao.get("preco_vs_mercado_pct")
-    ref  = "seu teto" if avaliacao.get("referencia") == "teto" else "mercado"
+    imovel = anuncio.get("tipo") == "imovel"
+    ref  = {"teto": "seu teto", "bairro": "mediana do bairro",
+            "cidade": "mediana da cidade"}.get(avaliacao.get("referencia"), "mercado")
     pct_txt = f" ({pct:+d}% vs {ref})" if pct is not None else ""
     cabecalho = {"negociar": "🟡 <b>VALE NEGOCIAR</b> — o preço compensa as ressalvas",
                  "suspeita": "⚠️ <b>PECHINCHA SUSPEITA</b> — barato demais, com sinal de golpe: confira antes",
-                 }.get(avaliacao.get("alerta"), f"{_REC_EMOJI.get(rec, '⚪')} <b>{rec}</b>")
+                 "novo": "🏠 <b>NOVO NO SEU FILTRO</b>",
+                 }.get(avaliacao.get("alerta"), "🟢 <b>ABAIXO DO MERCADO</b>" if imovel else f"{_REC_EMOJI.get(rec, '⚪')} <b>{rec}</b>")
+    if imovel and avaliacao.get("alerta") == "suspeita":
+        cabecalho = "⚠️ <b>BARATO DEMAIS</b> — padrão de golpe de aluguel: nunca pague antes de visitar"
     linhas = [
         f"{cabecalho} — Score {avaliacao.get('score', 0)}/10",
         f"🔎 <b>{esc(anuncio.get('nome') or anuncio.get('termo'))}</b>",
         "",
         f"📝 {esc(anuncio.get('titulo'))}",
-        f"💰 {_brl(anuncio.get('preco'))}{pct_txt}",
-        f"📍 {esc(anuncio.get('local') or 'N/A')} · 📦 {esc((anuncio.get('envio') or 'N/A').replace('_', ' '))}",
+        f"💰 {esc(avaliacao.get('custo')) if avaliacao.get('custo') else _brl(anuncio.get('preco'))}{pct_txt}",
+        f"📍 {esc(anuncio.get('local') or 'N/A')}" + (
+            "" if imovel else f" · 📦 {esc((anuncio.get('envio') or 'N/A').replace('_', ' '))}"),
         f"💲 {_AVP_EMOJI.get(avaliacao.get('avaliacao_preco'), '')}",
     ]
     for titulo, itens, n in (("✅ <b>A favor:</b>", avaliacao.get("pros"), 4),
@@ -156,7 +162,8 @@ async def enviar_queda(busca: dict, anuncio: dict, preco_antigo: float, anuncio_
     """Alerta de queda de preço num anúncio já monitorado."""
     novo = anuncio.get("preco") or 0
     pct = 100 * (1 - novo / preco_antigo) if preco_antigo else 0
-    teto = busca.get("preco_max") or 0
+    # imóvel: o teto vale p/ o total (com condomínio e IPTU), não p/ o aluguel
+    teto = 0 if busca.get("tipo") == "imovel" else busca.get("preco_max") or 0
     titulo = (f"💸 <b>ENTROU NO SEU TETO</b> (caiu {pct:.0f}%)" if teto and preco_antigo > teto >= novo
               else f"💸 <b>PREÇO CAIU {pct:.0f}%</b>")
     texto = (f"{titulo} — {esc(busca.get('nome'))}\n\n"

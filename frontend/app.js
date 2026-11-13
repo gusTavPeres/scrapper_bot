@@ -272,6 +272,7 @@ function renderCard(a) {
     ${a.motivo ? `<div class="anuncio-resumo">${esc(a.motivo)}</div>` : ''}
     ${a.alerta === 'negociar' ? '<div class="anuncio-rec rec-negociar">VALE NEGOCIAR</div>'
       : a.alerta === 'suspeita' ? '<div class="anuncio-rec rec-negociar">PECHINCHA SUSPEITA</div>'
+      : a.alerta === 'novo' ? '<div class="anuncio-rec rec-negociar">NOVO NO FILTRO</div>'
       : rec ? `<div class="anuncio-rec rec-${rec.toLowerCase()}">${rec}</div>` : ''}
   </div>`;
 }
@@ -302,7 +303,7 @@ function verDetalhe(anuncioId) {
       <div class="detalhe-preco-row">
         <div class="detalhe-preco-val">${brl(item.preco)}</div>
         ${pctHtml}
-        <span class="badge badge-${esc(rec || 'pendente')}" style="margin-left:auto">${item.alerta === 'negociar' ? 'VALE NEGOCIAR' : item.alerta === 'suspeita' ? 'PECHINCHA SUSPEITA' : esc(item.recomendacao || 'SEM ANÁLISE')}</span>
+        <span class="badge badge-${esc(rec || 'pendente')}" style="margin-left:auto">${item.alerta === 'negociar' ? 'VALE NEGOCIAR' : item.alerta === 'suspeita' ? 'PECHINCHA SUSPEITA' : item.alerta === 'novo' ? 'NOVO NO FILTRO' : esc(item.recomendacao || 'SEM ANÁLISE')}</span>
         ${item.score ? `<span class="mono" style="font-size:20px;font-weight:700">${Number(item.score)}/10</span>` : ''}
       </div>
       <div>
@@ -458,7 +459,22 @@ function preencherForm(b) {
   }
   document.getElementById("f-inclusao").value = (b?.criterios_inclusao || []).join("\n");
   document.getElementById("f-exclusao").value = (b?.criterios_exclusao || []).join("\n");
+  const ex = b?.filtros_extra || {};
+  for (const k of CAMPOS_IMOVEL) {
+    const v = ex[k];
+    document.getElementById("f-im-" + k).value =
+      Array.isArray(v) ? v.join(", ") : (v ?? (k === "negocio" ? "aluguel" : k === "imovel" ? "qualquer" : ""));
+  }
+  mostrarCamposDoTipo();
 }
+
+// filtros_extra da busca de imóvel (os de carro só existem no Telegram: o painel não mexe neles)
+const CAMPOS_IMOVEL = ["negocio", "imovel", "cidade", "bairros", "quartos_min", "vagas_min", "area_min"];
+
+function mostrarCamposDoTipo() {
+  document.getElementById("grupo-imovel").hidden = document.getElementById("f-tipo").value !== "imovel";
+}
+document.getElementById("f-tipo").addEventListener("change", mostrarCamposDoTipo);
 
 function abrirModalNovaBusca() {
   document.getElementById("modal-busca-titulo").textContent = "Nova Busca";
@@ -504,7 +520,16 @@ async function salvarBusca() {
     dados.categorias = [...document.querySelectorAll("#f-categorias input:checked")].map(i => i.value);
   }
 
-  if (!dados.nome || (!dados.termo && dados.tipo !== "carro")) {
+  if (dados.tipo === "imovel") {
+    dados.filtros_extra = {};
+    for (const k of CAMPOS_IMOVEL) {
+      const v = document.getElementById("f-im-" + k).value.trim();
+      if (v) dados.filtros_extra[k] = k === "bairros" ? v.split(",").map(s => s.trim()).filter(Boolean) : v;
+    }
+  } else if (bid && buscas.find(x => x.id == bid)?.tipo === "imovel") {
+    dados.filtros_extra = {};          // deixou de ser imóvel: os filtros de imóvel não valem mais
+  }
+  if (!dados.nome || (!dados.termo && dados.tipo === "produto")) {
     toast("Preencha nome e termo de busca.", "err");
     return;
   }

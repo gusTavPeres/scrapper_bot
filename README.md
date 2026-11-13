@@ -13,7 +13,8 @@ navegador) e avisa no Telegram quando aparece uma oportunidade.
   PC montado, acessório, lista de modelos, troca), regras do usuário
   ("sem X", "só com X", "prefiro X"), problemas por gravidade (leve / moderado /
   grave), golpe, preço vs. o teto do usuário ou a mediana de anúncios comparáveis,
-  e um classificador que aprende com os 👍/👎 dos alertas. Busca com teto: 1x/dia
+  e um classificador que aprende com os 👍/👎 dos alertas (só passa a opinar com
+  12 marcações, 4 de cada lado, e ignora especificação do produto). Busca com teto: 1x/dia
   o bot lê a busca SEM o teto e guarda a mediana do mercado (por memória: 8 GB e
   16 GB são mercados diferentes); dentro do teto só é 🟢 o que está 20%+ abaixo
   dela (pechincha), e metade do mercado é tratado como suspeito.
@@ -25,9 +26,24 @@ navegador) e avisa no Telegram quando aparece uma oportunidade.
   entrou no teto. Só depois de ler a
   descrição, e no máximo 5 por busca a cada rodada (o resto fica no `/top`).
   Anúncio republicado pelo vendedor não repete o alerta (parecido demais para
-  ter certeza vem com o aviso); anúncio só de troca não alerta. Bloqueio da OLX
+  ter certeza vem com o aviso); vendedor em série também não (mesma descrição ao
+  mesmo preço em qualquer bairro, ou o 3º anúncio no mesmo bairro e preço);
+  anúncio só de troca não alerta. Bloqueio da OLX
   só vira aviso depois de 1 h sem conseguir ler; Telegram fora do ar não perde
   alerta (sai quando ele volta).
+- **Imóveis para alugar** (`/addaluguel`, ou tipo "Imóvel" no painel): cidade e
+  bairro vão na URL da OLX; quartos, vagas, área e tipo (apartamento, casa,
+  quarto) filtram pela ficha do anúncio. O teto vale para o **custo total do
+  mês** (aluguel + condomínio + IPTU; IPTU anual digitado no campo mensal é
+  dividido por 12, "condomínio incluso" é lido da descrição). 1x/dia o bot mede
+  o mercado da cidade e dos bairros pedidos e compara cada anúncio com imóveis
+  do mesmo bairro, nº de quartos e tamanho parecido. Com teto, todo anúncio novo
+  que cabe nos filtros avisa: 🏠 NOVO NO SEU FILTRO, 🟢 ABAIXO DO MERCADO (entre
+  os 25% mais baratos dos comparáveis) ou ⚠️ BARATO DEMAIS (menos da metade: o
+  golpe clássico de aluguel). Temporada/diária, ponto comercial, vaga em
+  república e quem "procura imóvel" ficam de fora; as regras livres valem
+  ("só mobiliado", "sem fiador", "prefiro varanda"). `negocio=venda` faz o mesmo
+  para imóveis à venda.
 - **Mudança de formato da OLX não passa em silêncio:** cada página é conferida
   com o total de anúncios que a própria OLX declara, e 1x/dia uma busca ampla
   confere preço, data, foto, ordem por data e descrição. Se algo quebrar, o
@@ -71,7 +87,9 @@ responde com o seu chat id. Coloque-o no `.env` e reinicie.
 ## Usar
 
 Telegram: `/add rtx 5060 max=1.900`, `/add rtx 3090 com defeito`,
-`/addcarro linea ano=2011-2016 estado=sp`, `/buscas`, `/top`, `/categorias <id>`,
+`/addcarro linea ano=2011-2016 estado=sp`,
+`/addaluguel estado=sp cidade=campinas bairro=centro,cambui quartos=2 vagas=1 max=3000 obs= aceita pet`,
+`/buscas`, `/top`, `/categorias <id>`,
 `/scan <id>`, `/pausar <id>`, `/del <id> sim`, `/help`.
 O painel web faz o mesmo e mostra o detalhe de cada avaliação.
 
@@ -85,6 +103,6 @@ para aceitar só conexões da própria máquina). Segredos ficam só no `.env`
 ## Testes
 
 ```bash
-./venv/bin/python test_offline.py      # 89 testes de regressão (não usam rede nem o banco real)
-./venv/bin/python test_live_olx.py     # canário contra a OLX real (layout, RSC, ordem)
+./venv/bin/python test_offline.py      # 99 testes de regressão (não usam rede nem o banco real)
+./venv/bin/python test_live_olx.py     # canário contra a OLX real (layout, RSC, ordem, aluguel)
 ```

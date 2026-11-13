@@ -193,7 +193,7 @@ def test_p1_url():
     assert "carros-vans-e-utilitarios/estado-go?q=punto" in c
     assert u({"termo": "", "tipo": "carro", "filtros_extra": {"ano_min": 2010, "ano_max": 2014}},
              1).endswith("?o=1&sf=1&rs=2010&re=2014")
-    assert "/imoveis/estado-go?" in u({"termo": "casa", "tipo": "imovel", "estado": "go"}, 1)
+    assert "/imoveis/aluguel/estado-go?" in u({"termo": "casa", "tipo": "imovel", "estado": "go"}, 1)
 
 
 def test_p1_filtros():
@@ -682,10 +682,11 @@ def test_p3_classificador():
     def rot(titulo, desc, gostou, vendedor="particular"):
         return {"termo": "rtx 3090", "titulo": titulo, "descricao": desc, "atributos": "",
                 "vendedor": vendedor, "categoria": "Placas", "preco": 4000, "gostou": gostou}
-    rotulos = ([rot(f"RTX 3090 MSI Suprim {i}", "nota fiscal, garantia, nunca minerou", 1) for i in range(4)]
+    rotulos = ([rot(f"RTX 3090 MSI Suprim {i}", "nota fiscal, garantia, nunca minerou", 1) for i in range(6)]
                + [rot(f"RTX 3090 Zotac loja {i}", "loja, parcelo no cartão, envio imediato", 0, "loja")
-                  for i in range(4)])
-    assert not Classificador(rotulos[:5]).pronto                       # 4👍 1👎: ainda aprende
+                  for i in range(6)])
+    assert not Classificador(rotulos[:9]).pronto                       # 6👍 3👎: ainda aprende
+    assert not Classificador(rotulos[2:10]).pronto                     # 4👍 4👎: poucos rótulos
     m = Classificador(rotulos)
     assert m.pronto
     msi = _item(titulo="RTX 3090 MSI Suprim X", descricao="Com nota fiscal e garantia, nunca minerou, "
@@ -1487,7 +1488,8 @@ def test_p7_telegram_ramos_restantes():
     assert "Nenhuma busca" in tb.tratar_comando("/buscas") and "Monitor OLX" in tb.tratar_comando("/start")
     assert "termo" in tb.tratar_comando("/add tipo=produto min=10").lower() or \
         "/add" in tb.tratar_comando("/add tipo=produto min=10")
-    assert "criada" in tb.tratar_comando("/add rtx 3090 tipo=imovel")
+    assert "criada" in tb.tratar_comando("/add rtx 3090 tipo=carro")
+    assert "exige o estado" in tb.tratar_comando("/add rtx 3090 tipo=imovel")
     assert "inválido para tipo (use: produto, carro, imovel)" in tb.tratar_comando("/add x tipo=barco")
     assert "inválido para vendedor" in tb.tratar_comando("/add x vendedor=amigo")
     assert "Input should" not in tb.tratar_comando("/add x intervalo=abc") + tb.tratar_comando("/add x min=-5")
@@ -1823,8 +1825,8 @@ def test_p8_revisao_avaliador():
     assert "usada em mineração" in m["contras"], m
     # explicação do classificador usa palavras do anúncio
     rot = ([{"titulo": "RTX 3090 MSI Suprim", "descricao": "nota fiscal", "gostou": 1, "termo": "rtx 3090",
-             "avaliacao_preco": "bom"}] * 4 + [{"titulo": "RTX 3090 Zotac", "descricao": "loja parcelo",
-             "gostou": 0, "termo": "rtx 3090", "avaliacao_preco": "bom"}] * 4)
+             "avaliacao_preco": "bom"}] * 6 + [{"titulo": "RTX 3090 Zotac", "descricao": "loja parcelo",
+             "gostou": 0, "termo": "rtx 3090", "avaliacao_preco": "bom"}] * 6)
     delta, porque = avaliador.Classificador(rot).ajuste({"titulo": "RTX 3090 MSI Suprim", "termo": "rtx 3090",
                                                          "descricao": "nota fiscal", "avaliacao_preco": "bom"})
     assert delta > 0 and "bom" not in porque and "rtx 3090" not in porque, porque
@@ -2045,7 +2047,8 @@ def test_p10_republicacao_nao_realerta():
         lid = next(seq)
         aid, _, _ = db.upsert_anuncio(bid, {"url": f"https://x/a-{lid}", "list_id": lid,
                                             "titulo": titulo, "preco": preco, "local": local})
-        db.atualizar_descricao(aid, bid, _item()["descricao"])
+        # cada um com o seu texto: descrição igual ao mesmo preço É republicação (teste p13)
+        db.atualizar_descricao(aid, bid, f"Anúncio {lid}. " + _item()["descricao"])
         return aid
     n = NotifierFalso()
     t = "VENDO RTX 5060 MSI - R$ 1.800,00"
@@ -2075,10 +2078,14 @@ def test_p10_republicacao_nao_realerta():
     assert n.enviados[-2:] == [c1, c2], n.enviados
     assert "reanunciando" in n.avaliacoes[-1]["observacoes"][0], n.avaliacoes[-1]["observacoes"]
     assert not any("reanunciando" in o for o in n.avaliacoes[-2]["observacoes"])
-    # passadas 24 h, só o título quase igual segura: outra marca no mesmo lugar alerta
+    # passadas 24 h, só o título quase igual segura: outra marca onde só houve 1 alerta
     sql("UPDATE anuncios SET primeira_vez=datetime('now','-2 days')")
-    marca = anuncio("VENDO RTX 5060 GALAX - R$ 1.800,00")
+    marca = anuncio("VENDO RTX 5060 GALAX - R$ 1.800,00", local="Cidade C, Bairro 3")
     rodar(avaliador.processar_fila(n))
+    # ...mas o 3º anúncio no mesmo bairro e preço é vendedor em série: calado
+    anuncio("Placa RTX 5060 Gigabyte Eagle zerada", local="Cidade C, Bairro 3")
+    rodar(avaliador.processar_fila(n))
+    assert n.enviados[-1] == marca, n.enviados
     anuncio(t)                                                     # o mesmo título (MSI) não
     rodar(avaliador.processar_fila(n))
     assert n.enviados[-1] == marca, n.enviados
@@ -2831,10 +2838,10 @@ def test_p12_vendedor_em_serie_na_mesma_leva():
     def anuncio(titulo, preco=1289, local="Cidade E, Bairro 5"):
         aid, _, _ = db.upsert_anuncio(bid, {"url": f"https://x/a-{abs(hash(titulo)) % 10**7}", "titulo": titulo,
                                             "preco": preco, "local": local})
-        db.atualizar_descricao(aid, bid, _item()["descricao"])
+        db.atualizar_descricao(aid, bid, f"{titulo}. " + _item()["descricao"])
         return aid
     serie = [anuncio(f"Rtx 3060 12gb {m}") for m in ("Msi", "Colorful", "Galax", "")]
-    outros = [anuncio("Rtx 3060 12gb Asus", local="Cidade F, Bairro 6"), anuncio("Rtx 3060 12gb Zotac", preco=1350)]
+    outros = [anuncio("Rtx 3060 12gb Asus", local="Cidade F, Bairro 6"), anuncio("Rtx 3060 12gb Zotac", preco=1450)]
     n = NotifierFalso()
     rodar(avaliador.processar_fila(n))
     assert len([a for a in n.enviados if a in serie]) == 1, n.enviados
@@ -2882,6 +2889,537 @@ def test_fd_leak():
     for _ in range(50):
         db.tamanho_fila()
     assert len(os.listdir("/proc/self/fd")) - antes < 5
+
+
+# ── p13: avaliações revistas + imóveis para alugar ────────
+
+def test_p13_avaliacao_revista():
+    """Defeitos vistos nos alertas reais: o classificador de 👍/👎 rebaixava quase
+    tudo com 8 rótulos; "aceito 4090" contava como venda; "com problema" a preço de
+    sucata saía como pechincha suspeita."""
+    from avaliador import Classificador
+    assert not produto_bate("rtx 4090", "Rtx 5070 ti ,aceito 4090 ou 5080 volta a combinar")[0]
+    assert not produto_bate("rtx 3060", "Vendo 3070, pego rtx 3060 na troca")[0]
+    assert produto_bate("rtx 5070 ti", "Rtx 5070 ti ,aceito 4090 ou 5080 volta a combinar")[0]
+    assert produto_bate("rtx 4090", "RTX 4090 aceito troca")[0]
+    assert produto_bate("rtx 4090", "Aceito pix RTX 4090 lacrada")[0]
+    assert not produto_bate("rtx 3060", "TROCO RX 6600 8GB NOVA EM UMA RTX 3060")[0]
+    assert not produto_bate("rtx 3060", "Troco minha rx 580 por rtx 3060")[0]
+    assert produto_bate("rtx 3060", "Vendo ou troco RTX 3060 por 4070")[0]
+    assert produto_bate("rtx 3060", "Troco ou vendo RTX 3060 em perfeito estado")[0]
+    assert produto_bate("rx 6600", "TROCO RX 6600 8GB NOVA EM UMA RTX 3060")[0]
+    # classificador: 8 rótulos não bastam; especificação e termo da busca não são gosto
+    rot = lambda t, d, g: {"termo": "rtx 3060", "titulo": t, "descricao": d, "gostou": g}
+    poucos = [rot("RTX 3060 12GB Maxsun", "12gb gddr6 192 bit", 0)] * 3 + [rot("RTX 3060 Asus", "na caixa", 1)] * 5
+    assert not Classificador(poucos).pronto
+    toks = avaliador.tokens_clf({"termo": "rtx 3060", "titulo": "RTX 3060 12GB GeForce Asus Dual",
+                                 "descricao": "12 gb de memoria gddr6, placa de video em otimo estado"})
+    assert toks == {"t:asus", "t:dual", "d:memoria", "d:otimo", "d:estado"}, toks
+    muitos = ([rot(f"RTX 3060 Asus {i}", "nota fiscal e caixa", 1) for i in range(6)]
+              + [rot(f"RTX 3060 Colorful {i}", "sem caixa, retirada", 0) for i in range(5)]
+              + [rot("RTX 3060 Palit rara", "unica palavra", 0)])
+    m = Classificador(muitos)
+    assert m.pronto and m.ajuste({"termo": "rtx 3060", "titulo": "RTX 3060 Palit rara", "descricao": "unica"})[0] == 0
+    assert m.ajuste({"termo": "rtx 3060", "titulo": "RTX 3060 Colorful", "descricao": "sem caixa, retirada"})[0] < 0
+    # ressalva "moderada" a preço de sucata = problema sério: aparece, sem alerta
+    merc = {"n": 20, "mediana": 2000, "variantes": {}}
+    it = _item(termo="rtx 3060", titulo="Rtx 3060 com problema na vram", preco=800, preco_max=1500, mercado=merc,
+               descricao="Placa com problema na vram, vendo no valor que está anunciado, retirada em mãos apenas.")
+    av = avaliar(it, [])
+    assert av["alerta"] == "" and "preço de peça" in av["motivo"], av
+    # lacrada 45% abaixo do mercado (que é de usados): alerta, mas como ⚠️
+    longa = "Placa nova, nunca aberta, comprada em loja, acompanha nota fiscal e garantia do fabricante, retirada em mãos."
+    lacrada = avaliar({**it, "titulo": "RTX 3060 12GB Lacrada", "preco": 1100, "descricao": longa}, [])
+    assert lacrada["alerta"] == "suspeita" and "lacrado a preço de usado" in " ".join(lacrada["observacoes"]), lacrada
+    assert avaliar({**it, "titulo": "RTX 3060 12GB", "preco": 1100, "descricao": longa}, [])["alerta"] == "comprar"
+    ok = avaliar({**it, "titulo": "Rtx 3060 12gb", "preco": 1500, "descricao": "Um fan com avaria, mas em perfeito "
+                  "funcionamento, testada em jogos, acompanha a caixa original da placa."}, [])
+    assert ok["alerta"] == "negociar" and any("avaria" in c for c in ok["contras"]), ok
+
+
+def test_p13_vendedor_em_serie_entre_rodadas():
+    """O vendedor em série troca título e bairro e posta em rodadas diferentes: a
+    descrição colada ao mesmo preço, ou o 3º anúncio no mesmo bairro e preço, não
+    alertam de novo. Imóvel fica de fora da regra do bairro."""
+    novo_banco()
+    bid = criar(termo="rtx 2060", preco_max=950)
+    sql("UPDATE buscas SET criado_em=datetime('now','-3 days')")
+    seq = iter(range(8100, 8200))
+    colada = ("RTX 2060 6GB. Placa de vídeo em excelente estado de conservação, funcionando perfeitamente, "
+              "ideal para jogos em full hd e tarefas do dia a dia.")
+    def anuncio(titulo, local, desc, preco=700):
+        lid = next(seq)
+        aid, _, _ = db.upsert_anuncio(bid, {"url": f"https://x/a-{lid}", "list_id": lid, "titulo": titulo,
+                                            "preco": preco, "local": local})
+        db.atualizar_descricao(aid, bid, desc)
+        return aid
+    n = NotifierFalso()
+    a = anuncio("Rtx 2060 6gb Msi", "Cidade A, Bairro 1", colada)
+    rodar(avaliador.processar_fila(n))
+    b = anuncio("Rtx 2060 Evga na caixa", "Cidade B, Centro", colada + " Tags: gtx 1660.")   # outro bairro, texto colado
+    rodar(avaliador.processar_fila(n))
+    assert n.enviados == [a] and sql("SELECT notificado FROM anuncios WHERE id=?", b)[0][0], n.enviados
+    outro_preco = anuncio("Rtx 2060 Zotac", "Cidade B, Centro", colada, preco=760)          # preço diferente: alerta
+    rodar(avaliador.processar_fila(n))
+    assert n.enviados[-1] == outro_preco
+    # mesmo bairro e preço, textos diferentes: 1º alerta, 2º alerta com aviso, 3º calado
+    ids = []
+    for i, marca in enumerate(("Galax", "Pny", "Gigabyte")):
+        ids.append(anuncio(f"Placa Rtx 2060 {marca}", "Cidade C, Bairro 9", f"Texto próprio número {i}: " + "x" * 80, preco=800))
+        rodar(avaliador.processar_fila(n))
+    assert n.enviados[-2:] == ids[:2], (n.enviados, ids)
+    assert "reanunciando" in n.avaliacoes[-1]["observacoes"][0]
+    # imóvel: vários aluguéis de mesmo preço no mesmo bairro é o normal
+    cands = [{"id": i, "titulo": f"Apartamento {i}", "local": "Cidade C, Bairro 9", "preco": 2000.0,
+              "descricao": f"descrição {i}", "recente": 1} for i in range(3)]
+    orig = db.alertados_parecidos
+    db.alertados_parecidos = lambda *a: cands
+    try:
+        item = {"busca_id": 1, "anuncio_id": 99, "titulo": "Apartamento novo", "local": "Cidade C, Bairro 9",
+                "preco": 2000.0, "descricao": "outro texto"}
+        assert avaliador.republicacao({**item, "tipo": "imovel"}) == (None, False)
+        assert avaliador.republicacao(item) == (0, True)
+    finally:
+        db.alertados_parecidos = orig
+
+
+def _imovel_olx(lid, titulo, aluguel, local="Cidade Alfa, Bairro Um", cat="Apartamentos", negocio="Aluguel",
+                data=1792716949, **props):
+    """Anúncio de imóvel como a OLX manda (properties com os rótulos reais)."""
+    rot = {"condominio": "Condomínio", "iptu": "IPTU", "size": "Área útil", "rooms": "Quartos",
+           "bathrooms": "Banheiros", "garage_spaces": "Vagas na garagem"}
+    ps = [{"name": "category", "label": "Categoria", "value": cat}]
+    if negocio:
+        ps.append({"name": "real_estate_type", "label": "Tipo", "value": f"{negocio} - apartamento padrão"})
+    ps += [{"name": k, "label": rot[k], "value": str(v)} for k, v in props.items()]
+    return anuncio_olx(lid, titulo, aluguel, location=local, category=cat, properties=ps, date=data)
+
+
+def _ap(**kw):
+    """Anúncio de aluguel já mapeado (como sai do scheduler)."""
+    base = dict(condominio="R$ 500", iptu="R$ 100", size="60m²", rooms="2", garage_spaces="1")
+    campos = {k: kw.pop(k) for k in list(kw) if k in ("lid", "titulo", "aluguel", "local", "cat", "negocio")}
+    ad = _imovel_olx(campos.pop("lid", 1), campos.pop("titulo", "Apartamento 2 quartos"),
+                     campos.pop("aluguel", 2000), **campos, **{**base, **kw})
+    return scheduler._mapear_flight_ad(ad)
+
+
+_BUSCA_AP = {"tipo": "imovel", "estado": "go", "termo": "", "preco_max": 3000,
+             "filtros_extra": {"cidade": "Cidade Alfa", "imovel": "apartamento", "quartos_min": 2, "vagas_min": 1}}
+
+
+def test_p13_aluguel_url_e_filtros():
+    """URL no formato verificado na OLX (estado/cidade/bairro no caminho; quartos e
+    vagas como lista) e os filtros locais sobre a ficha do anúncio."""
+    u = lambda extras, **kw: scheduler._montar_url({"tipo": "imovel", "estado": "go", "termo": "",
+                                                    "filtros_extra": extras, **kw}, 2)
+    assert u({}) == "https://www.olx.com.br/imoveis/aluguel/estado-go?o=2&sf=1"
+    assert "/imoveis/aluguel/apartamentos/estado-go/vila-acai?" in u({"cidade": "Vila Açaí", "imovel": "apartamento"})
+    assert "/imoveis/venda/casas/estado-go/vila-acai/bairro-um?" in u(
+        {"cidade": "Vila Açaí", "imovel": "casa", "negocio": "venda", "bairros": ["Bairro Um"]})
+    varios = u({"cidade": "Vila Açaí", "bairros": ["Bairro Um", "Centro"], "quartos_min": 3, "vagas_min": 2,
+                "area_min": 70}, preco_max=2000, filtro_vendedor="particular", termo="kitnet")
+    assert "/estado-go/vila-acai?q=kitnet&" in varios and "bairro" not in varios        # vários bairros: filtro local
+    assert varios.endswith("&pe=2300&f=p&ros=3&ros=4&ros=5&gsp=2&gsp=3&gsp=4&gsp=5&ss=70"), varios
+    assert "/imoveis/aluguel/estado-go?" in u({"imovel": "quarto"})                     # quarto: categoria no filtro local
+    # ficha + custo
+    a = _ap()
+    assert a["categoria"] == "Apartamentos (aluguel)" and "Vagas na garagem: 1" in a["atributos"], a
+    im = avaliador.dados_imovel(a)
+    assert (im["cond"], im["iptu"], im["area"], im["quartos"], im["vagas"], im["cidade"], im["bairro"]) == \
+        (500, 100, 60, 2, 1, "cidade alfa", "bairro um"), im
+    sem = avaliador.dados_imovel(_ap(size="", rooms="5 ou mais", garage_spaces="0"))
+    assert (sem["area"], sem["quartos"], sem["vagas"]) == (None, 5, 0), sem
+    passa = lambda extras, **kw: avaliador.passa_filtros_imovel({"filtros_extra": extras}, _ap(**kw))
+    assert passa({"cidade": "cidade alfa", "bairros": ["um"], "quartos_min": 2, "vagas_min": 1, "area_min": 60})[0]
+    assert passa({"cidade": "Alfa"}) == (False, "outra cidade")                  # nome parcial não é a cidade
+    assert not passa({"bairros": ["centro", "dois"]})[0]
+    assert passa({"bairros": ["centro"]}, local="Cidade Alfa", titulo="Apto no Centro")[0]   # sem bairro: vale o título
+    assert not passa({"bairros": ["centro"]}, local="Cidade Alfa")[0]
+    assert "abaixo do mínimo" in passa({"quartos_min": 3})[1] and not passa({"vagas_min": 2})[0]
+    assert not passa({"area_min": 61})[0] and passa({"area_min": 61}, size="")[0]            # sem área: passa
+    assert passa({}, negocio="Venda") == (False, "anúncio de venda")
+    assert passa({"negocio": "venda"}, negocio="Venda")[0] and not passa({"negocio": "venda"})[0]
+    assert not passa({"imovel": "casa"})[0] and passa({"imovel": "casa"}, cat="Casas")[0]
+    assert not passa({}, cat="Aluguel de quartos", negocio="")[0]
+    assert passa({"imovel": "quarto"}, cat="Aluguel de quartos", negocio="")[0]
+    assert not passa({}, cat="Comércio e indústria")[0]
+    # triagem: o que não é moradia p/ alugar
+    tri = lambda titulo, termo="", **ex: avaliador.triagem({"tipo": "imovel", "termo": termo, "filtros_extra": ex},
+                                                           _ap(titulo=titulo))
+    assert tri("Apartamento 2 quartos com 1 vaga para carro")[0]
+    for titulo, motivo in (("Procuro apartamento para alugar", "PROCURA"), ("Apartamento por temporada", "temporada"),
+                           ("Apto mobiliado diária R$ 150", "temporada"), ("Sala comercial no centro", "comercial"),
+                           ("Vaga em república feminina", "compartilhada")):
+        assert motivo in tri(titulo)[1], (titulo, tri(titulo))
+    assert tri("Sala comercial no centro", termo="sala comercial")[0]               # é o que se procura
+    assert avaliador.triagem({"tipo": "imovel", "termo": "", "filtros_extra": {"negocio": "venda"}},
+                             _ap(titulo="Casa de temporada", negocio="Venda"))[0]
+    # o scheduler não grava o que os filtros recusam, e imóvel ignora o filtro de envio
+    ads = [_ap(lid=1), _ap(lid=2, local="Cidade Beta, Centro"), _ap(lid=3, rooms="1"), _ap(lid=4, aluguel=3500)]
+    ficou = scheduler.filtrar_produtos({**_BUSCA_AP, "filtro_envio": "com_envio"}, ads)
+    assert [a["list_id"] for a in ficou] == [1], ficou
+
+
+def test_p13_aluguel_custo_total():
+    """O custo do mês é aluguel + condomínio + IPTU, com os vícios do preenchimento."""
+    custo = lambda texto="", **kw: avaliador.custo_imovel(_ap(**kw), avaliador.norm(texto))
+    assert custo()[:2] == (2600, "aluguel R$ 2.000 + cond. R$ 500 + IPTU R$ 100")
+    assert custo(iptu="R$ 1.405")[0] == 2617                       # IPTU anual no campo mensal: /12
+    total, _, avisos = custo(condominio="R$ 3.500")
+    assert total == 2100 and "parece erro" in avisos[0]
+    assert custo(condominio="R$ 1")[0] == 2100                     # campo preenchido por preencher
+    total, _, avisos = custo("Valor com condomínio e IPTU inclusos.")
+    assert total == 2000 and "incluso" in avisos[0]
+    assert custo("Condomínio não incluso. Água inclusa.")[0] == 2600
+    # o que o CONDOMÍNIO cobre não é "condomínio incluso" (saía "abaixo do mercado" falso)
+    for texto in ("Água e gás inclusos no condomínio.", "Condomínio R$ 500 (inclui água e gás).",
+                  "Condomínio de R$ 500 com água inclusa.", "Valores não inclusos: condomínio e IPTU."):
+        assert custo(texto)[0] == 2600, texto
+    assert custo("IPTU incluso, condomínio não incluso.")[0] == 2500
+    assert custo("Condomínio à parte, IPTU incluso no aluguel.")[0] == 2500
+    for texto in ("Condomínio, água e IPTU inclusos.", "Aluguel já incluso condomínio e IPTU.",
+                  "O valor inclui o condomínio e iptu."):
+        assert custo(texto)[0] == 2000, texto
+    assert "Não informa o condomínio" in custo(condominio="")[2][0]
+    assert custo(condominio="", cat="Casas")[2] == []              # casa sem condomínio é o normal
+    assert avaliador.custo_imovel({"preco": 0, "atributos": ""}) == (0, "", [])
+
+
+def _mercado_ap():
+    """Amostra: Bairro Um com 2 quartos, ~60 m² (10 pontos) e ~120 m² (6); Bairro Dois
+    só com 3 pontos (cai p/ a cidade)."""
+    um = [[t, 60] for t in (2400, 2500, 2600, 2700, 2800, 2900, 3000, 3100, 3200, 3300)] + \
+         [[t, 120] for t in (4800, 5000, 5200, 5400, 5600, 5800)]
+    return {"n": 19, "mediana": 3100, "amostras": {"cidade alfa|bairro um|2": um,
+                                                  "cidade alfa|bairro dois|2": [[2000, 55], [2100, 60], [2200, 62]]}}
+
+
+def test_p13_aluguel_avaliacao():
+    """Nota do aluguel: custo total contra imóveis do mesmo bairro, quartos e
+    tamanho; todo anúncio novo dentro do teto avisa ("novo"), o barato de verdade
+    ganha destaque, o barato demais sai com ⚠️."""
+    desc = ("Apartamento de 2 quartos com armários, sala ampla, cozinha planejada e uma vaga de garagem "
+            "coberta. Prédio com elevador e portaria 24 horas. Aceita pet.")
+    def item(**kw):
+        extra = {k: kw.pop(k) for k in ("instrucoes", "preco_max", "descricao", "mercado", "feedback") if k in kw}
+        return {**_BUSCA_AP, "anuncio_id": 1, "busca_id": 1, "nome": "aluguel", "instrucoes": "",
+                "criterios_inclusao": [], "criterios_exclusao": [], **_ap(**kw),
+                "descricao": desc, "mercado": _mercado_ap(), **extra}
+    r = avaliador.referencia_imovel(item())
+    assert (r["mediana"], r["n"], r["escopo"], r["tamanho"]) == (2850, 10, "bairro", True), r
+    r = avaliador.referencia_imovel(item(size="120m²"))
+    assert (r["mediana"], r["n"], r["tamanho"]) == (5300, 6, True), r
+    # sem área não dá p/ escolher os parecidos: 60 m² e 120 m² juntos variam demais = sem referência
+    assert avaliador.referencia_imovel(item(size="")) is None
+    so60 = {"amostras": {"cidade alfa|bairro um|2": _mercado_ap()["amostras"]["cidade alfa|bairro um|2"][:10]}}
+    r = avaliador.referencia_imovel(item(size="", mercado=so60))
+    assert (r["n"], r["tamanho"], r["escopo"]) == (10, False, "bairro"), r
+    r = avaliador.referencia_imovel(item(local="Cidade Alfa, Bairro Dois"))      # bairro com 3 pontos: a cidade
+    assert r["escopo"] == "cidade" and r["n"] >= 5, r
+    assert avaliador.referencia_imovel(item(rooms="4")) is None
+    assert avaliador.referencia_imovel(item(mercado="")) is None
+
+    normal = avaliar(item(aluguel=2250), [])                             # total 2.850 = a mediana
+    assert (normal["alerta"], normal["avaliacao_preco"], normal["recomendacao"]) == ("novo", "justo", "VER"), normal
+    assert normal["custo"] == "R$ 2.850/mês (aluguel R$ 2.250 + cond. R$ 500 + IPTU R$ 100)", normal["custo"]
+    assert normal["referencia"] == "bairro" and normal["pros"][0] == "2 quarto(s) · 60 m² · 1 vaga(s)", normal
+    assert "aceita pet" in normal["pros"] and "de tamanho parecido" in normal["resumo"]
+    barato = avaliar(item(aluguel=1750), [])                             # total 2.350: abaixo do p10
+    assert (barato["alerta"], barato["avaliacao_preco"], barato["recomendacao"]) == ("comprar", "bom", "COMPRAR"), barato
+    assert barato["score"] > normal["score"]
+    demais = avaliar(item(aluguel=700), [])                              # total 1.300: -54% = padrão de golpe
+    assert (demais["alerta"], demais["avaliacao_preco"]) == ("suspeita", "suspeito") and demais["score"] <= 7, demais
+    assert "nunca pague" in " ".join(demais["observacoes"])
+    # teto vale p/ o TOTAL: aluguel 2.900 cabe, mas com condomínio e IPTU passa 17%
+    acima = avaliar(item(aluguel=2900), [])
+    assert acima["alerta"] == "" and acima["recomendacao"] == "IGNORAR" and "O aluguel cabe" in acima["observacoes"][0], acima
+    pouco = avaliar(item(aluguel=2500), [])                              # total 3.100: 3% acima, sem falar em negociar
+    assert pouco["alerta"] == "" and pouco["recomendacao"] == "VER", pouco
+    negocia = avaliar(item(aluguel=2700, descricao=desc + " Aceito proposta."), [])
+    assert negocia["alerta"] == "negociar" and negocia["avaliacao_preco"] == "negociavel", negocia
+    # sem teto: só o barato de verdade avisa; sem mercado e com teto: "novo"
+    assert avaliar(item(aluguel=2250, preco_max=0), [])["alerta"] == ""
+    assert avaliar(item(aluguel=1750, preco_max=0), [])["alerta"] == "comprar"
+    sem_ref = avaliar(item(mercado=""), [])
+    assert sem_ref["alerta"] == "novo" and sem_ref["avaliacao_preco"] == "sem_base", sem_ref
+    # sinais do texto
+    golpe = avaliar(item(aluguel=1750, descricao=desc + " Estou no exterior, envio as chaves pelos correios."), [])
+    assert golpe["alerta"] == "" and golpe["recomendacao"] == "IGNORAR" and "golpe" in golpe["motivo"], golpe
+    mofo = avaliar(item(aluguel=1750, descricao=desc + " Tem infiltração no banheiro."), [])
+    assert mofo["alerta"] == "negociar" and "⚠️ infiltração" in mofo["contras"], mofo
+    assert avaliar(item(descricao=desc + " Sem infiltração."), [])["contras"] == []
+    gar = avaliar(item(descricao=desc + " Exige fiador ou seguro fiança."), [])
+    assert "Garantia pedida: fiador, seguro-fiança" in gar["observacoes"], gar
+    assert "sem fiador" in avaliar(item(descricao=desc + " Sem fiador."), [])["pros"]
+    assert "não aceita pet" in avaliar(item(descricao=desc.replace("Aceita pet", "Não aceita pet")), [])["contras"]
+    # regras livres do usuário valem como em produto
+    assert avaliar(item(instrucoes="sem fiador", descricao=desc + " Exige fiador."), [])["decisao"] == "EXCLUIDO"
+    assert avaliar(item(instrucoes="sem fiador", descricao=desc + " Sem fiador."), [])["decisao"] == "APROVADO"
+    mob = avaliar(item(instrucoes="só mobiliado"), [])
+    assert mob["decisao"] == "APROVADO" and any("mobiliado" in o for o in mob["observacoes"]), mob
+    assert avaliar(item(instrucoes="só mobiliado", descricao=desc + " Não mobiliado."), [])["decisao"] == "EXCLUIDO"
+    assert "atende: mobiliado" in avaliar(item(instrucoes="prefiro mobiliado", descricao=desc + " Mobiliado."), [])["pros"]
+    # triagem refeita na avaliação (filtro editado depois da coleta) e o 👎
+    assert avaliar(item(rooms="1"), [])["decisao"] == "EXCLUIDO"
+    assert avaliar(item(titulo="Apartamento por temporada"), [])["motivo"] == "aluguel por temporada/diária"
+    assert avaliar(item(feedback=0), [])["decisao"] == "EXCLUIDO"
+    sem_desc = avaliar(item(aluguel=1750, descricao=""), [])
+    assert sem_desc["score"] <= 7 and sem_desc["alerta"] == "comprar", sem_desc      # a fila só envia com a descrição
+    # venda: o preço é o total, sem "/mês"
+    venda = avaliar({**item(negocio="Venda", aluguel=300000, preco_max=400000, mercado=""),
+                     "filtros_extra": {**_BUSCA_AP["filtros_extra"], "negocio": "venda"}}, [])
+    assert venda["custo"] == "R$ 300.000" and venda["alerta"] == "novo", venda
+
+
+def test_p13_aluguel_ponta_a_ponta():
+    """/addaluguel -> scan -> mercado por bairro -> avaliação -> alerta no Telegram."""
+    novo_banco()
+    r = tb.tratar_comando("/addaluguel estado=go cidade=cidade_alfa bairro=bairro_um,centro imovel=apartamento "
+                          "quartos=2 vagas=1 max=3000 obs= sem fiador")
+    assert "criada" in r and "cidade alfa (bairro um, centro)" in r and "2 quarto(s)+" in r, r
+    b = db.listar_buscas()[0]
+    assert b["nome"] == "aluguel apartamento 2q+ bairro um, centro" and b["tipo"] == "imovel", b
+    assert b["filtros_extra"] == {"bairros": ["bairro um", "centro"], "cidade": "cidade alfa",
+                                  "imovel": "apartamento", "quartos_min": 2, "vagas_min": 1}, b["filtros_extra"]
+    desc = "Apartamento com armários, sala ampla e cozinha planejada. Prédio com elevador. Direto com o proprietário."
+    eco = '<script>self.__next_f.push([1,"\\"loc_municipality_id\\":\\"123\\""])</script>'
+    def pagina(ads):
+        return pagina_olx(ads).replace("</html>", eco + "</html>")
+    mercado = [_imovel_olx(9100 + i, f"Apto mercado {i}", 1900 + 100 * i, condominio="R$ 500", iptu="R$ 100",
+                           size="60m²", rooms="2", garage_spaces="1") for i in range(10)]
+    busca = [_imovel_olx(9001, "Apartamento 2 quartos no Bairro Um", 1750, condominio="R$ 500", iptu="R$ 100",
+                         size="60m²", rooms="2", garage_spaces="1"),
+             _imovel_olx(9002, "Apartamento 2 quartos reformado", 2250, condominio="R$ 500", iptu="R$ 100",
+                         size="62m²", rooms="2", garage_spaces="1"),
+             _imovel_olx(9003, "Apartamento em outro bairro", 1800, local="Cidade Alfa, Bairro Nove", rooms="2",
+                         garage_spaces="1"),
+             _imovel_olx(9004, "Apartamento por temporada", 1800, rooms="2", garage_spaces="1")]
+    olx = OlxFalsa({"pe=": (200, pagina(busca)), "anuncio-": (200, pagina_anuncio(desc)),
+                    "o=1&sf=1": (200, pagina(mercado))})
+    scheduler._sessao = olx
+    textos = []
+    notifier._post = lambda metodo, dados, timeout: bool(textos.append(dados.get("caption") or dados.get("text"))) or True
+    rodar(scheduler.processar_busca(db.obter_busca(b["id"])))
+    urls = olx.paginas()
+    assert any("/imoveis/aluguel/apartamentos/estado-go/cidade-alfa?o=1&sf=1&pe=3450&ros=2" in u for u in urls), urls
+    assert any("/cidade-alfa/bairro-um?o=1" in u and "pe=" not in u for u in urls), urls       # mercado do bairro
+    assert all(p.startswith("RSC ") and p.endswith("&_rsc") for p in olx.pedidos if "anuncio-" not in p), olx.pedidos
+    assert sql("SELECT COUNT(*) FROM anuncios")[0][0] == 3                    # o de outro bairro nem é gravado
+    m = db.obter_busca(b["id"])["mercado"]
+    assert m["n"] == 10 and len(m["amostras"]["cidade alfa|bairro um|2"]) == 10, m
+    rodar(avaliador.processar_fila(notifier))
+    an = {r[0]: r[1:] for r in sql("SELECT a.titulo, an.decisao, an.alerta, an.avaliacao_preco FROM analises an "
+                                   "JOIN anuncios a ON a.id = an.anuncio_id")}
+    assert an["Apartamento 2 quartos no Bairro Um"] == ("APROVADO", "comprar", "bom"), an
+    assert an["Apartamento 2 quartos reformado"] == ("APROVADO", "novo", "justo"), an
+    assert an["Apartamento por temporada"][0] == "EXCLUIDO", an
+    alertas = [t for t in textos if "Ver anúncio" in t]
+    assert len(alertas) == 2, textos
+    assert "ABAIXO DO MERCADO" in alertas[0] and "R$ 2.350/mês (aluguel R$ 1.750 + cond. R$ 500 + IPTU R$ 100)" in alertas[0]
+    assert "vs mediana do bairro" in alertas[0] and "📦" not in alertas[0] and "direto com o proprietário" in alertas[0]
+    assert "NOVO NO SEU FILTRO" in alertas[1], alertas[1]
+    # rodada seguinte: nada novo, nenhum alerta repetido; o mercado não é remedido no mesmo dia
+    n = len(olx.pedidos)
+    sql("UPDATE buscas SET proximo_scan=datetime('now','-1 minute')")
+    rodar(scheduler.processar_busca(db.obter_busca(b["id"])))
+    rodar(avaliador.processar_fila(notifier))
+    assert len([t for t in textos if "Ver anúncio" in t]) == 2 and all("pe=" in u for u in olx.pedidos[n:]), olx.pedidos[n:]
+    # cidade que a OLX não reconhece (ela ignora e devolveria o estado inteiro): erro claro, na hora
+    avisos = []
+    notifier.alertar = lambda chave, texto, horas=12: avisos.append((chave, texto)) or True
+    scheduler._sessao = OlxFalsa({"o=1": (200, pagina_olx(busca))})           # sem o eco do local
+    sql("UPDATE buscas SET fase='scan'")
+    rodar(scheduler.processar_busca(db.obter_busca(b["id"])))
+    assert avisos and avisos[0][0] == f"local:{b['id']}" and "não reconheceu a cidade “cidade alfa”" in avisos[0][1], avisos
+    assert sql("SELECT COUNT(*) FROM anuncios")[0][0] == 3
+    # ...ou responde 5xx: busca que nunca leu nada avisa na hora; a que já leu espera as 6 h
+    nova = db.criar_busca({"nome": "nova", "tipo": "imovel", "termo": "", "estado": "go",
+                           "filtros_extra": {"cidade": "Errada"}})
+    scheduler._sessao = OlxFalsa({"o=1": (504, "")})
+    avisos.clear()
+    rodar(scheduler.processar_busca(db.obter_busca(nova)))
+    rodar(scheduler.processar_busca(db.obter_busca(b["id"])))
+    assert [a[0] for a in avisos] == [f"local:{nova}"] and "“Errada”" in avisos[0][1], avisos
+    # imóvel SEM teto também mede o mercado (é a única referência de preço)
+    assert db.mercado_vencido(db.criar_busca({"nome": "x", "tipo": "imovel", "termo": "", "estado": "go"}))
+
+
+def test_p13_aluguel_telegram_e_validacao():
+    """Opções do /addaluguel e as regras entre campos, iguais ao criar e ao editar."""
+    from models import BuscaCreate
+    novo_banco()
+    assert "/addaluguel estado=uf" in tb.tratar_comando("/addaluguel") and "/addaluguel" in tb.tratar_comando("/help")
+    assert "exige o estado" in tb.tratar_comando("/addaluguel cidade=cidade_alfa max=2000")
+    assert "bairros exigem a cidade" in tb.tratar_comando("/addaluguel estado=go bairro=centro")
+    assert "Opção desconhecida" in tb.tratar_comando("/add rtx 3090 cidade=alfa")          # só no /addaluguel
+    assert "Valor inválido" in tb.tratar_comando("/addaluguel estado=go quartos=dois")
+    for ruim, erro in (("quartos=9", "quartos_min fora de 1-5"), ("imovel=castelo", "imovel deve ser um de"),
+                       ("negocio=troca", "negocio deve ser"), ("cidade=123", "cidade inválida"),
+                       ("area=0", "area_min fora de")):
+        assert erro in tb.tratar_comando(f"/addaluguel estado=go {ruim}"), (ruim, tb.tratar_comando(f"/addaluguel estado=go {ruim}"))
+    r = tb.tratar_comando("/addaluguel kitnet estado=go cidade=cidade_alfa negocio=venda area=40")
+    assert "criada" in r and "40 m²+" in r, r
+    b = db.listar_buscas()[-1]
+    assert b["termo"] == "kitnet" and b["filtros_extra"] == {"area_min": 40, "cidade": "cidade alfa", "negocio": "venda"}, b
+    assert b["condicao"] == "funcionando"
+    assert "criada" in tb.tratar_comando("/addimovel estado=go")                  # o estado inteiro é permitido
+    cria = lambda **kw: BuscaCreate(**{"nome": "n", "termo": "", "tipo": "imovel", "estado": "go", **kw})
+    assert cria(filtros_extra={"bairros": "Centro, Bairro_Um ,", "cidade": " Cidade   Alfa "}).filtros_extra == \
+        {"bairros": ["Centro", "Bairro Um"], "cidade": "Cidade Alfa"}
+    assert cria(termo="apartamento para reforma com defeito").condicao == "funcionando"
+    for ruim in ({"ano_min": 2010}, {"bairros": ["x" * 61], "cidade": "Alfa"}, {"bairros": ["a"] * 11, "cidade": "Alfa"},
+                 {"vagas_min": "1e400"}, {"cidade": "<b>"}, {"outro": 1}):
+        try:
+            cria(filtros_extra=ruim)
+            assert False, f"aceitou {ruim}"
+        except ValueError:
+            pass
+    for kw in ({"tipo": "produto", "termo": "rtx 3090", "filtros_extra": {"cidade": "Alfa"}},
+               {"tipo": "carro", "filtros_extra": {"quartos_min": 2}}):
+        try:
+            cria(**kw)
+            assert False, f"aceitou {kw}"
+        except ValueError as e:
+            assert "não valem" in str(e), e
+    # API: editar respeita as mesmas regras e mudar o filtro reavalia e remede
+    import main
+    from fastapi.testclient import TestClient
+    main.USUARIO, main.SENHA = "u", "p"
+    c, A = TestClient(main.app), ("u", "p")
+    h = {"Sec-Fetch-Site": "same-origin"}
+    r = c.post("/api/buscas", auth=A, headers=h, json={"nome": "ap", "tipo": "imovel", "estado": "go", "preco_max": 2500,
+                                                        "filtros_extra": {"cidade": "Cidade Alfa", "quartos_min": "2"}})
+    assert r.status_code == 201, r.text
+    bid = r.json()["id"]
+    assert db.obter_busca(bid)["filtros_extra"] == {"cidade": "Cidade Alfa", "quartos_min": 2}
+    assert c.patch(f"/api/buscas/{bid}", auth=A, headers=h, json={"estado": "brasil"}).status_code == 422
+    assert c.patch(f"/api/buscas/{bid}", auth=A, headers=h, json={"tipo": "produto"}).status_code == 422   # sem termo
+    assert c.patch(f"/api/buscas/{bid}", auth=A, headers=h,
+                   json={"filtros_extra": {"bairros": ["Centro"]}}).status_code == 422                     # perdeu a cidade
+    sql("UPDATE buscas SET fase='monitor', mercado='{\"n\": 1}' WHERE id=?", bid)
+    r = c.patch(f"/api/buscas/{bid}", auth=A, headers=h,
+                json={"filtros_extra": {"cidade": "Cidade Alfa", "bairros": ["Centro"]}})
+    assert r.status_code == 200 and r.json()["alterados"] == ["filtros_extra"], r.text
+    b = db.obter_busca(bid)
+    assert b["fase"] == "scan" and b["mercado"] == "", b
+
+
+def test_p13_revisao_independente():
+    """Bugs reproduzidos pela revisão independente das regras de imóvel e de troca."""
+    desc = ("Apartamento de 2 quartos com armários, sala ampla, cozinha planejada e uma vaga de garagem "
+            "coberta. Prédio com elevador e portaria 24 horas.")
+    def item(descricao=desc, **kw):
+        extra = {k: kw.pop(k) for k in ("instrucoes",) if k in kw}
+        return {**_BUSCA_AP, "anuncio_id": 1, "busca_id": 1, "nome": "aluguel", "instrucoes": "",
+                "criterios_inclusao": [], "criterios_exclusao": [], **_ap(aluguel=2250, **kw),
+                "descricao": descricao, "mercado": _mercado_ap(), **extra}
+    # frases inocentes não são golpe; as do golpe continuam sendo
+    for frase in ("Favor agendar por mensagem antes da visita.", "Pintura nova no exterior do prédio.",
+                  "Contrato enviado pelo correio eletrônico."):
+        assert avaliar(item(desc + " " + frase), [])["alerta"] == "novo", frase
+    for frase in ("Estou no exterior a trabalho.", "Faça o pix antes da visita para reservar.", "Envio as chaves por Sedex."):
+        assert "golpe" in avaliar(item(desc + " " + frase), [])["motivo"], frase
+    # moradia legítima que as expressões largas vetavam
+    tri = lambda t, **ex: avaliador.triagem({"tipo": "imovel", "termo": "", "filtros_extra": ex}, _ap(titulo=t))
+    for t in ("Apartamento 2 quartos Av. República do Líbano", "Apartamento 1 quarto na República - metrô",
+              "Kitnet ideal para quem não quer dividir", "Apartamento com portaria 24 horas por dia",
+              "Aluguel anual, não é temporada - apto 2 quartos", "Apartamento mensal (sem diárias)",
+              "Apartamento Jardim Carnaval", "Apartamento próximo à loja de departamentos",
+              "Apartamento 3 quartos, ótimo para home office/escritório", "Busco inquilino para apto 2 quartos"):
+        assert tri(t) == (True, ""), (t, tri(t))
+    for t in ("Procurando apartamento para alugar", "Preciso de apartamento para alugar urgente",
+              "Quero alugar casa 2 quartos", "Estou à procura de kitnet", "Vaga em república masculina",
+              "Divido apartamento com estudante", "Apartamento por temporada", "Galpão ou sala comercial"):
+        assert not tri(t)[0], t
+    # "dispensa fiador" atende a regra "sem fiador"
+    av = avaliar(item(desc + " Dispensa fiador.", instrucoes="sem fiador"), [])
+    assert av["decisao"] == "APROVADO" and "sem fiador" in av["pros"], av
+    # "sem problemas de infiltração ou mofo": a lista herda o "sem"
+    assert avaliar(item(desc + " Sem problemas de infiltração ou mofo."), [])["contras"] == []
+    assert "⚠️ mofo" in avaliar(item(desc + " Tem um pouco de mofo no quarto."), [])["contras"]
+    # cidade com hífen/espaço duplo é a mesma; bairro casa por palavra inteira
+    passa = lambda extras, **kw: avaliador.passa_filtros_imovel({"filtros_extra": extras}, _ap(**kw))[0]
+    assert passa({"cidade": "cidade-alfa"}) and passa({"cidade": "Cidade  Alfa"}) and not passa({"cidade": "cidade beta"})
+    assert passa({"bairros": ["bairro-um"]}) and passa({"bairros": ["um"]})
+    assert not passa({"bairros": ["sul"]}, local="Cidade Alfa, Consulado")
+    # Garantia da OLX não existe em imóvel: não pode descartar tudo
+    assert len(scheduler.filtrar_produtos({**_BUSCA_AP, "garantia": "pay"}, [_ap(lid=1)])) == 1
+    # validador não grava lixo
+    from models import BuscaCreate
+    for ruim in ({"cidade": None}, {"cidade": True}, {"cidade": "Alfa", "bairros": [None]},
+                 {"cidade": "Alfa", "bairros": [["x", "y"]]}, {"cidade": "Alfa", "bairros": ["!!"]}):
+        try:
+            BuscaCreate(nome="n", tipo="imovel", estado="go", filtros_extra=ruim)
+            assert False, f"aceitou {ruim}"
+        except ValueError:
+            pass
+    novo_banco()
+    assert "criada" in tb.tratar_comando("/addaluguel estado=go cidade=cidade_alfa bairro=Centro,,")
+    assert db.listar_buscas()[0]["nome"] == "aluguel centro", db.listar_buscas()[0]["nome"]
+    # venda legítima com "troco"/"aceito" no título; a troca de verdade segue vetada
+    for termo, t in (("galaxy s23", "Vendo ou troco celular em ótimo estado Galaxy S23"),
+                     ("ps5", "Vendo ou troco console em perfeito estado PS5 com 2 controles"),
+                     ("rtx 3070", "Asus Dual vendo ou troco usada pouco tempo em jogos RTX 3070"),
+                     ("rtx 3060", "Placa de vídeo aceito 1200 rtx 3060 12gb"), ("rtx 3080", "vendo ou pego 2500 rtx 3080")):
+        assert produto_bate(termo, t)[0], (termo, t, produto_bate(termo, t))
+    # ressalva moderada: teto folgado não a transforma em grave
+    base = {**_item(), "titulo": "Rtx 3060 12gb", "termo": "rtx 3060", "preco": 1400,
+            "descricao": "Um fan com avaria, mas em perfeito funcionamento, testada em jogos, acompanha a caixa original da placa."}
+    assert avaliar({**base, "preco_max": 2500}, [])["alerta"] == avaliar({**base, "preco_max": 3500}, [])["alerta"] == "negociar"
+
+
+def test_p13_republicacao_e_queda_de_imovel():
+    """Imóveis diferentes com título/descrição-modelo iguais alertam os dois; o
+    mesmo imóvel repostado não; queda só do aluguel não é "entrou no teto"."""
+    novo_banco()
+    assert "criada" in tb.tratar_comando("/addaluguel estado=go cidade=cidade_alfa max=3000")
+    b = db.listar_buscas()[0]
+    sql("UPDATE buscas SET criado_em=datetime('now','-3 days')")
+    modelo = "A Imobiliária Exemplo aluga excelente apartamento pronto para morar, em ótima localização da cidade. "
+    def grava(lid, titulo, desc, aluguel=1800, **props):
+        ficha = dict(size="60m²", condominio="R$ 500", iptu="R$ 100", rooms="2", garage_spaces="1") | props
+        p = scheduler._mapear_flight_ad(_imovel_olx(lid, titulo, aluguel, **ficha))
+        aid, novo, antigo = db.upsert_anuncio(b["id"], p)
+        db.atualizar_descricao(aid, b["id"], desc)
+        return aid
+    n = NotifierFalso()
+    a1 = grava(1, "Apartamento 2 quartos Bairro Um", modelo + "Unidade A.")
+    a2 = grava(2, "Apartamento 2 quartos no Bairro Um", modelo + "Unidade B.", size="75m²", garage_spaces="2")
+    a3 = grava(3, "Apartamento 3 quartos Bairro Um", modelo + "Unidade C.", rooms="3", size="90m²")
+    rodar(avaliador.processar_fila(n))
+    assert sorted(n.enviados) == [a1, a2, a3], n.enviados
+    grava(4, "Apartamento 2 quartos Bairro Um!", modelo + "Unidade A.")        # o mesmo imóvel, repostado
+    rodar(avaliador.processar_fila(n))
+    assert len(n.enviados) == 3, n.enviados
+    # produto: texto do fabricante colado por vendedores de ESTADOS diferentes não é o mesmo vendedor
+    bid = criar(termo="rtx 3060", preco_max=1600)
+    sql("UPDATE buscas SET criado_em=datetime('now','-3 days')")
+    fab = "A GeForce RTX 3060 permite que você encare os games mais recentes usando o poder da arquitetura Ampere."
+    ids = []
+    for lid, sub, local in ((11, "sp", "Cidade X, Bairro 1"), (12, "pr", "Cidade Y, Bairro 2"), (13, "sp", "Cidade Z, Bairro 3")):
+        aid, _, _ = db.upsert_anuncio(bid, {"url": f"https://{sub}.olx.com.br/x/placa-{lid}", "list_id": lid,
+                                            "titulo": f"RTX 3060 12GB n{lid}", "preco": 1500, "local": local})
+        db.atualizar_descricao(aid, bid, fab)
+        ids.append(aid)
+        rodar(avaliador.processar_fila(n))
+    assert n.enviados[3:] == ids[:2], (n.enviados, ids)                       # o 3º (mesmo estado do 1º) é o vendedor em série
+    # queda de preço: aluguel 3.100 -> 2.950 "cruza" o teto de 3.000, mas o total (3.550) não
+    quedas = []
+    async def queda(busca, p, antigo, aid=None):
+        quedas.append(p["titulo"])
+        return True
+    notifier.enviar_queda = queda
+    caro = _imovel_olx(20, "Apartamento caro", 3100, condominio="R$ 500", iptu="R$ 100", rooms="2")
+    eco = '<script>self.__next_f.push([1,"\\"loc_municipality_id\\":\\"1\\""])</script>'
+    pag = lambda ad: pagina_olx([ad]).replace("</html>", eco + "</html>")
+    scheduler._preencher_descricoes = _sem_espera
+    scheduler._sessao = OlxFalsa({"pe=": (200, pag(caro)), "o=1": (200, pagina_olx([]))})
+    rodar(scheduler.processar_busca(db.obter_busca(b["id"])))
+    rodar(avaliador.processar_fila(None))
+    scheduler._sessao = OlxFalsa({"pe=": (200, pag({**caro, "priceValue": "R$ 2.950"})), "o=1": (200, pagina_olx([]))})
+    rodar(scheduler.processar_busca(db.obter_busca(b["id"])))
+    assert quedas == [], quedas
 
 
 if __name__ == "__main__":

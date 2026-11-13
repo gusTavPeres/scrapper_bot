@@ -50,7 +50,7 @@ def norm(texto: str) -> str:
 
 
 _NEGADORES = {"nao", "nunca", "sem", "nem", "zero", "jamais", "nenhum", "nenhuma",
-              "isento", "isenta", "livre", "contra", "nada"}   # "garantia contra defeitos", "nada de mineração"
+              "isento", "isenta", "livre", "contra", "nada", "dispensa", "dispensamos"}   # "garantia contra defeitos", "nada de mineração"
 # enchimento entre o negador e a chave: "não apresenta qualquer tipo de defeito"
 _ENCHIMENTO = re.compile(r"\b(?:qualquer tipo de|nenhum tipo de|tipo de|qualquer)\b")
 
@@ -203,7 +203,15 @@ def termo_de_busca(termo: str) -> str:
     return " ".join(ficam) or termo
 
 
+# "troco por 5060", e com o que ele TEM no meio: "Troco RX 6600 8gb nova em uma RTX 3060"
 _RE_TROCA = re.compile(r"\b(troco|troca|trocar)\s+(por|em|numa?|pra|para|na|no)\b(\s+\w+){0,4}\s*$")
+# só sem "vendo" no título: "Vendo ou troco celular em ótimo estado Galaxy S23" é venda
+_RE_TROCA_MEIO = re.compile(r"\b(troco|troca|trocar)\b(\s+\w+){1,5}?\s+(por|em\s+uma?|numa?|pra|para)\b(\s+\w+){0,4}\s*$")
+# "Rtx 5070 ti, aceito 4090 ou 5080": o que ele ACEITA na troca, não o que vende
+# (só enchimento de placa entre o verbo e o número: "aceito pix RTX 4090" é venda;
+# número só em lista "4090 ou": "aceito 1200 rtx 3060" é o PREÇO que ele aceita)
+_RE_ACEITA = re.compile(r"\b(?:aceito|aceita|pego)\s+(?:(?:uma?|sua|seu|placa|rtx|gtx|rx)\s+|"
+                        r"\d{3,4}[a-z]*\s*(?:ou|e|,|/)\s*){0,6}$")
 _RE_COMPARA = re.compile(r"(\b(melhor|pior|mais forte|mais rapida?|superior|inferior)\s+(que|a)\b|"
                          r"\b(vs|versus|supera|bate)\b|=|"
                          r"\b(igual|equivalente|equivale|similar|tipo|nivel)\b(\s+(a|ao|de|da|uma?)\b)?|"
@@ -266,7 +274,9 @@ def produto_bate(termo: str, titulo: str) -> tuple[bool, str]:
         # (RTX 5070)") ou o que o vendedor QUER na troca ("RX 7600 troco por rtx
         # 5060", "Rtx 5070 troca pra 5070 ti") não conta: o sufixo (Ti/Super) é
         # checado só nas menções livres
-        troca = [i for i in ocorr if _RE_TROCA.search(ti[max(0, i - 40):i])]
+        troca = [i for i in ocorr if _RE_TROCA.search(ti[max(0, i - 40):i])
+                 or _RE_ACEITA.search(ti[max(0, i - 40):i])
+                 or (not re.search(r"\bvend", ti) and _RE_TROCA_MEIO.search(ti[max(0, i - 50):i]))]
         comparacao = [i for i in ocorr if _so_comparacao(ti, i)]
         livres = [i for i in ocorr if i not in troca and i not in comparacao]
         if not livres:
@@ -376,9 +386,14 @@ def identidade(termo: str, anuncio: dict) -> tuple[bool, str]:
 def triagem(busca: dict, anuncio: dict) -> tuple[bool, str]:
     """Filtro barato da ENTRADA (antes de baixar descrição): identidade +
     categorias da OLX escolhidas pelo usuário (vazio = todas)."""
-    ok, motivo = identidade(busca.get("termo") or "", anuncio)
-    if not ok:
-        return False, f"Checagem de modelo: {motivo}"
+    if busca.get("tipo") == "imovel":
+        ok, motivo = triagem_imovel(busca, anuncio)
+        if not ok:
+            return False, motivo
+    else:
+        ok, motivo = identidade(busca.get("termo") or "", anuncio)
+        if not ok:
+            return False, f"Checagem de modelo: {motivo}"
     cats, cat = _lista(busca.get("categorias")), anuncio.get("categoria") or ""
     if cats and cat and cat not in cats:
         return False, f"Categoria '{cat}' fora do filtro da busca"
@@ -408,7 +423,7 @@ PROBLEMAS = [
     ("coil whine", "coil whine", 2), ("barulh", "barulho", 2), ("bios modificad", "BIOS modificada", 2),
     ("tela quebrad", "tela quebrada", 2), ("trincad", "trincado", 2),
     ("quebrad", "quebrado", 2), ("rachad", "rachado", 2), ("rachou", "rachado", 2),
-    ("desligando sozinh", "desliga sozinha", 2), ("vendo como esta", "vendido no estado", 2),
+    ("desligando sozinh", "desliga sozinha", 2), ("avaria", "avaria", 2), ("vendo como esta", "vendido no estado", 2),
     ("vendo no estado", "vendido no estado", 2), ("no estado em que", "vendido no estado", 2),
     ("risco", "riscos", 1), ("riscad", "riscos", 1), ("arranh", "arranhões", 1),
     ("marcas de uso", "marcas de uso", 1), ("sinais de uso", "marcas de uso", 1),
@@ -684,15 +699,24 @@ def referencia_mercado(item: dict) -> tuple[float | None, int]:
 
 _STOP_CLF = _VAZIAS | _CONECTIVOS | {"que", "nao", "sim", "mais", "muito", "bem", "esta",
                                      "tem", "ate", "foi", "sao", "meu", "minha", "vendo", "venda"}
-MIN_ROTULOS, MIN_POR_CLASSE = 6, 2
+# Com 8 rótulos (3 👎) ele rebaixava quase todo alerta: "parecido com o que você
+# rejeitou (gb, 12, memoria)" — especificação do produto virava gosto. Agora: mais
+# rótulos p/ ligar, palavra só conta vista em 2+ rótulos, número/unidade/termo
+# da busca não contam, e o 👎 num anúncio não condena a busca inteira (sem "b:")
+MIN_ROTULOS, MIN_POR_CLASSE, MIN_APOIO = 12, 4, 2
+_LINHAS = {"nvidia", "geforce", "radeon", "intel", "amd", "placa", "video", "processador", "gddr6"}
 
 
 def tokens_clf(d: dict) -> set[str]:
+    do_termo = set(re.findall(r"[a-z0-9]+", norm(d.get("termo"))))
+
     def palavras(t):
-        return {p for p in re.findall(r"[a-z0-9]+", norm(t)) if len(p) > 1 and p not in _STOP_CLF}
+        return {p for p in re.findall(r"[a-z0-9]+", norm(t))
+                if len(p) > 2 and p not in _STOP_CLF | _UNIDADES | _LINHAS | do_termo
+                and not any(c.isdigit() for c in p)}
     toks = {f"t:{p}" for p in palavras(d.get("titulo"))}
     toks |= {f"d:{p}" for p in palavras(f"{d.get('atributos') or ''} {d.get('descricao') or ''}")}
-    for campo, pre in (("vendedor", "v"), ("categoria", "c"), ("avaliacao_preco", "p"), ("termo", "b")):
+    for campo, pre in (("vendedor", "v"), ("categoria", "c"), ("avaliacao_preco", "p")):
         if d.get(campo):
             toks.add(f"{pre}:{norm(d[campo])}")
     return toks
@@ -716,7 +740,7 @@ class Classificador:
         contrib = []
         for t in tokens_clf(d):
             c1, c0 = self.cont[1].get(t, 0), self.cont[0].get(t, 0)
-            if c1 + c0 == 0:
+            if c1 + c0 < MIN_APOIO:
                 continue
             contrib.append((math.log((c1 + 1) / (self.n[1] + 2)) - math.log((c0 + 1) / (self.n[0] + 2)), t))
         return sum(v for v, _ in contrib), contrib
@@ -735,12 +759,388 @@ class Classificador:
                        else f"parecido com o que você rejeitou ({termos})")
 
 
+# ── IMÓVEL (aluguel e venda) ──────────────────────────────
+# Imóvel não tem "modelo": o que identifica é ONDE (cidade/bairro), o tamanho
+# (quartos, área, vagas) e o CUSTO TOTAL do mês — aluguel + condomínio + IPTU. O
+# anúncio de R$ 1.800 com R$ 900 de condomínio custa mais que o de R$ 2.300 sem.
+# O preço se compara com a mediana do mesmo bairro e nº de quartos (dados reais de
+# uma capital: dentro do bairro os totais variam 0,3-0,55 da mediana; na cidade
+# inteira 0,6-0,7 — por isso a cidade é referência só aproximada).
+DISPERSAO_CIDADE = 0.75
+# expressões estreitas: "Av. República", "portaria 24 horas por dia", "próximo à loja X" e
+# "ótimo para home office/escritório" são moradia. Negada não veta ("não é temporada")
+_RE_PROCURA = re.compile(r"\b(procuro|procura-se|procurando|a procura de|preciso (?:de|alugar)|busco|"
+                         r"quero alugar|compro)\b(?!.*\b(?:inquilin|morador))")
+_RE_TEMPORADA = re.compile(r"\b(temporada|diarias?|por noite|airbnb|reveillon)\b")
+_RE_COMERCIAL = re.compile(r"\b(sala comercial|ponto comercial|imovel comercial|galpao|consultorio)\b")
+_RE_DIVIDIR = re.compile(r"\b(divido|dividir (?:ap|apto|apartamento|casa|aluguel|quarto)|vaga em republica|"
+                         r"quarto em republica|republica (?:feminina|masculina|estudantil|de estudantes)|"
+                         r"quarto compartilhado|pensionato|pensao)\b")
+_CATEGORIA_IMOVEL = {"apartamento": ("apartamentos",), "casa": ("casas",),
+                     "quarto": ("aluguel de quartos",), "qualquer": ("apartamentos", "casas")}
+POSITIVOS_IMOVEL = [
+    ("semimobiliad", "semimobiliado"), ("semi mobiliad", "semimobiliado"),
+    ("semi-mobiliad", "semimobiliado"), ("mobiliad", "mobiliado"),
+    ("aceita pet", "aceita pet"), ("aceita anima", "aceita pet"), ("pet friendly", "aceita pet"),
+    ("direto com o proprietario", "direto com o proprietário"),
+    ("direto com proprietario", "direto com o proprietário"),
+    ("armarios", "armários"), ("planejad", "armários"), ("ar condicionado", "ar-condicionado"),
+    ("portaria 24", "portaria 24 h"), ("elevador", "elevador"), ("varanda", "varanda"),
+    ("sacada", "varanda"), ("piscina", "piscina"), ("academia", "academia"),
+    ("reformad", "reformado"), ("suite", "suíte"),
+]
+_NEGADOS_IMOVEL = {"mobiliado": "não mobiliado", "aceita pet": "não aceita pet", "elevador": "sem elevador"}
+PROBLEMAS_IMOVEL = [("infiltra", "infiltração"), ("mofo", "mofo"), ("vazamento", "vazamento"),
+                    ("precisa de reforma", "precisa de reforma"),
+                    ("precisando de reforma", "precisa de reforma"), ("precisa de reparo", "precisa de reparo")]
+# "pagamento antecipado" NÃO entra: aluguel antecipado (sem fiador) é contrato comum
+# frases inteiras: "agendar antes da visita" e "pintura no exterior do prédio" são inocentes
+GOLPE_IMOVEL = [("pix antecipado", "pix antecipado"), ("taxa de reserva", "taxa de reserva"),
+                ("taxa de visita", "taxa de visita"), ("sinal para reservar", "sinal antecipado")] + [
+    (f"{p} antes da visita", "pagamento antes da visita") for p in ("pagamento", "pagar", "deposito", "pix", "sinal")] + [
+    (f"{v} no exterior", "proprietário no exterior") for v in ("moro", "mora", "estou", "esta", "trabalho", "trabalha")] + [
+    ("fora do pais", "proprietário no exterior"), ("chaves pelo correio", "chaves pelo correio"),
+    ("chaves pelos correios", "chaves pelo correio"), ("chave pelo correio", "chaves pelo correio"),
+    ("envio as chaves", "chaves pelo correio"), ("envio a chave", "chaves pelo correio")]
+GARANTIAS_IMOVEL = [("fiador", "fiador"), ("caucao", "caução"), ("seguro fianca", "seguro-fiança"),
+                    ("titulo de capitalizacao", "título de capitalização")]
+
+
+def _extras(d: dict) -> dict:
+    e = d.get("filtros_extra") or {}
+    if isinstance(e, str):
+        try:
+            e = json.loads(e)
+        except ValueError:
+            e = {}
+    return e if isinstance(e, dict) else {}
+
+
+def _palavras(t) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", norm(t)).strip()
+
+
+def _numero(txt: str):
+    """'R$ 1.050' -> 1050 · '61m²' -> 61 · '5 ou mais' -> 5 · '' -> None."""
+    m = re.search(r"\d[\d.]*", txt or "")
+    return int(m.group().replace(".", "") or 0) if m else None
+
+
+def dados_imovel(d: dict) -> dict:
+    """Ficha do imóvel pelos atributos da OLX. None = o anúncio não informa."""
+    atrib = d.get("atributos") or ""
+
+    def campo(rotulo):
+        m = re.search(rf"(?:^|· ){rotulo}: ([^·]+)", atrib)
+        return _numero(m.group(1)) if m else None
+    cidade, _, bairro = (d.get("local") or "").partition(", ")
+    return {"cond": campo("Condomínio") or 0, "iptu": campo("IPTU") or 0,
+            "area": campo("Área útil") or None, "quartos": campo("Quartos"),
+            "vagas": campo("Vagas na garagem"), "cidade": norm(cidade).strip(), "bairro": norm(bairro).strip()}
+
+
+_TAXAS = r"(?:condominio|iptu|agua|gas|taxas?|luz|energia|internet)"
+
+
+def _incluso(texto: str, nome: str) -> bool:
+    """O anúncio diz que `nome` (condomínio/IPTU) já está no aluguel: "condomínio e
+    IPTU inclusos", "incluso condomínio", "valor inclui o condomínio". O contrário
+    não conta: "condomínio (inclui água)" e "água inclusa no condomínio" falam do
+    que o CONDOMÍNIO cobre, e "condomínio não incluso" nega."""
+    depois = rf"\b{nome}\b(?:,?\s+(?:e|ja|esta|estao|sao|{_TAXAS}))*\s+(?:inclus[oa]s?|incluid[oa]s?)\b"
+    antes = rf"\b(?:inclui|incluindo|inclus[oa]s?|incluid[oa]s?)\s+(?:os?\s+)?(?:{_TAXAS},?\s+(?:e\s+)?)*{nome}\b"
+    return any(not _negado(texto[max(0, m.start() - 30):m.start()])
+               for m in re.finditer(f"{depois}|{antes}", texto))
+
+
+def custo_imovel(d: dict, texto: str = "") -> tuple[float, str, list[str]]:
+    """(total do mês, detalhamento, avisos): aluguel + condomínio + IPTU.
+    IPTU acima de 30% do aluguel é o valor ANUAL digitado no campo mensal (na
+    amostra real aparece IPTU de metade do aluguel) -> divide por 12. Condomínio
+    maior que 1,5x o aluguel é erro de digitação: fica de fora, com aviso; abaixo de
+    R$ 30 é campo preenchido por preencher."""
+    im, aluguel = dados_imovel(d), d.get("preco") or 0
+    if not aluguel:
+        return 0, "", []
+    cond, iptu, avisos, partes = im["cond"], im["iptu"], [], [f"aluguel {_brl(aluguel)}"]
+    if cond < 30:
+        cond = 0                               # "R$ 1" só p/ preencher o campo
+    if cond > 1.5 * aluguel:
+        avisos.append(f"Condomínio informado ({_brl(cond)}) parece erro — confirme o valor")
+        cond = 0
+    elif cond and _incluso(texto, "condominio"):
+        avisos.append("O anúncio diz que o condomínio já está incluso no aluguel")
+        cond = 0
+    elif not cond and "apartamento" in norm(d.get("categoria")) and not _incluso(texto, "condominio"):
+        avisos.append("Não informa o condomínio — o total pode ser maior, pergunte")
+    if iptu > 0.3 * aluguel:
+        iptu = round(iptu / 12)
+    if iptu and _incluso(texto, "iptu"):
+        iptu = 0
+    if cond:
+        partes.append(f"cond. {_brl(cond)}")
+    if iptu:
+        partes.append(f"IPTU {_brl(iptu)}")
+    return aluguel + cond + iptu, " + ".join(partes), avisos
+
+
+def passa_filtros_imovel(busca: dict, a: dict) -> tuple[bool, str]:
+    """Filtros determinísticos da busca de imóvel sobre a ficha da OLX: negócio,
+    tipo, cidade, bairros, quartos, vagas, área. Quartos/vagas/área ausentes no
+    anúncio passam (a avaliação avisa); bairro ausente só passa se o título cita
+    um dos bairros pedidos."""
+    ex, im, cat = _extras(busca), dados_imovel(a), a.get("categoria") or ""
+    outro = "aluguel" if ex.get("negocio") == "venda" else "venda"
+    if f"({outro})" in cat:
+        return False, f"anúncio de {outro}"
+    if cat and not norm(cat).startswith(_CATEGORIA_IMOVEL.get(ex.get("imovel") or "qualquer",
+                                                              _CATEGORIA_IMOVEL["qualquer"])):
+        return False, f"'{cat}' não é o tipo de imóvel procurado"
+    # "cidade-alfa", "Cidade  Alfa" e "cidade alfa" são a mesma (a URL também as iguala)
+    if ex.get("cidade") and im["cidade"] and _palavras(im["cidade"]) != _palavras(ex["cidade"]):
+        return False, "outra cidade"
+    bairros, onde = [_palavras(b) for b in ex.get("bairros") or []], _palavras(im["bairro"] or a.get("titulo"))
+    # por palavra inteira: "sul" não casa "Consulado"
+    if bairros and not any(b and f" {b} " in f" {onde} " for b in bairros):
+        return False, "bairro fora da sua lista"
+    for chave, campo, rotulo in (("quartos_min", "quartos", "quarto(s)"), ("vagas_min", "vagas", "vaga(s)"),
+                                 ("area_min", "area", "m²")):
+        if ex.get(chave) and im[campo] is not None and im[campo] < ex[chave]:
+            return False, f"{im[campo]} {rotulo}: abaixo do mínimo de {ex[chave]}"
+    return True, ""
+
+
+def triagem_imovel(busca: dict, a: dict) -> tuple[bool, str]:
+    """Filtros + o que não é moradia p/ alugar: quem PROCURA imóvel, temporada/
+    diária, ponto comercial, vaga em república. Palavra que está no termo da
+    busca não veta ("sala comercial")."""
+    ok, motivo = passa_filtros_imovel(busca, a)
+    if not ok:
+        return False, motivo
+    ex, ti, termo = _extras(busca), norm(a.get("titulo")), norm(busca.get("termo"))
+    veta = lambda rx: (m := rx.search(ti)) and m.group(0).strip() not in termo \
+        and afirmado(ti, m.group(1)) is not False
+    if veta(_RE_PROCURA):
+        return False, "anúncio de quem PROCURA imóvel"
+    if ex.get("negocio") != "venda" and veta(_RE_TEMPORADA):
+        return False, "aluguel por temporada/diária"
+    if veta(_RE_COMERCIAL):
+        return False, "imóvel comercial"
+    if ex.get("imovel") != "quarto" and veta(_RE_DIVIDIR):
+        return False, "quarto/vaga compartilhada"
+    return True, ""
+
+
+def resumo_mercado_imovel(anuncios: list[dict]) -> dict | None:
+    """Amostra do mercado: {'cidade|bairro|quartos': [[custo total, área], ...]}.
+    Guarda os pontos, não só a mediana: a referência de cada anúncio sai dos
+    imóveis de TAMANHO parecido (ver referencia_imovel)."""
+    amostras: dict[str, list] = {}
+    for a in anuncios:
+        im, total = dados_imovel(a), custo_imovel(a)[0]
+        if total and im["quartos"] is not None and im["cidade"]:
+            amostras.setdefault(f"{im['cidade']}|{im['bairro']}|{im['quartos']}", []).append(
+                [round(total), im["area"] or 0])
+    todos = [t for vs in amostras.values() for t, _ in vs]
+    if len(todos) < 5:
+        return None
+    return {"n": len(todos), "mediana": round(statistics.median(todos)),
+            "amostras": dict(sorted(amostras.items()))}
+
+
+def referencia_imovel(item: dict) -> dict | None:
+    """Com o que comparar o custo deste imóvel: mesmo nº de quartos, no bairro
+    (ou, sem amostra, na cidade), e de tamanho parecido (área de -25% a +33%)
+    quando há 5 assim. Medido numa capital: contra a mediana do bairro INTEIRO, quase
+    tudo abaixo de um teto modesto saía "abaixo do mercado" — o bairro mistura
+    60 m² simples com 120 m² mobiliado. Devolve mediana, 1º quartil (q1), 10º
+    percentil (p10, só com 10+ pontos), n e o escopo."""
+    m, im = item.get("mercado"), dados_imovel(item)
+    if isinstance(m, str):
+        try:
+            m = json.loads(m) if m else None
+        except ValueError:
+            m = None
+    am = m.get("amostras") if isinstance(m, dict) else None
+    if not isinstance(am, dict) or im["quartos"] is None:
+        return None
+    q, area = im["quartos"], im["area"]
+    cidade = [x for k, v in am.items() if k.startswith(f"{im['cidade']}|") and k.endswith(f"|{q}") for x in v]
+    for grupo, escopo, limite in ((am.get(f"{im['cidade']}|{im['bairro']}|{q}") or [], "bairro", DISPERSAO_MAX),
+                                  (cidade, "cidade", DISPERSAO_CIDADE)):
+        parecidos = [t for t, a in grupo if area and a and 0.75 * area <= a <= 1.33 * area]
+        vs = parecidos if len(parecidos) >= 5 else [t for t, _ in grupo]
+        if len(vs) < 5:
+            continue
+        q1, med, q3 = statistics.quantiles(vs, n=4)
+        if (q3 - q1) / med <= limite:
+            return {"mediana": round(med), "q1": q1, "q3": q3, "n": len(vs), "escopo": escopo,
+                    "p10": statistics.quantiles(vs, n=10)[0] if len(vs) >= 10 else None,
+                    "tamanho": vs is parecidos}
+    return None
+
+
+def avaliar_imovel(item: dict, texto: str, regras: list, modelo, descartado: str | None) -> dict:
+    """Aluguel/venda de imóvel. Diferente de produto, avisa de TODO anúncio novo
+    que cabe no teto e nos filtros ("novo"): bom aluguel some em horas e o filtro
+    já é estreito; o preço contra a mediana do bairro dá a nota e o destaque."""
+    titulo, ex, im = item.get("titulo") or "", _extras(item), dados_imovel(item)
+    venda = ex.get("negocio") == "venda"
+    desc = (item.get("descricao") or "").strip()
+    sem_desc = desc in ("", "(sem descrição)")
+    preco, teto = item.get("preco") or 0, item.get("preco_max") or 0
+    total, detalhe, obs = (preco, "", []) if venda else custo_imovel(item, texto)
+    score, pros, contras, motivos = 6, [], [], []
+
+    ficha = [f"{im[c]} {r}" for c, r in (("quartos", "quarto(s)"), ("area", "m²"), ("vagas", "vaga(s)"))
+             if im[c] is not None]
+    if ficha:
+        pros.append(" · ".join(ficha))
+    faltam = [r for ch, c, r in (("quartos_min", "quartos", "os quartos"), ("vagas_min", "vagas", "as vagas"),
+                                 ("area_min", "area", "a área")) if ex.get(ch) and im[c] is None]
+    if faltam:
+        obs.append(f"Não informa {', '.join(faltam)} — confirme antes de visitar")
+
+    # "sem problemas de infiltração ou mofo": o 2º item da lista herda o "sem"
+    probs = [r for ch, r in dict(PROBLEMAS_IMOVEL).items() if afirmado(texto, ch) and not re.search(
+        rf"\b(?:sem|nao|nenhum\w*)\b[^.;!\n]{{0,40}}(?:\bou|\bnem|,)\s+(?:de\s+)?{ch}", texto)]
+    probs = list(dict.fromkeys(probs))
+    if probs:
+        score -= 2
+        contras += [f"⚠️ {r}" for r in probs]
+        motivos.append(f"ressalva: {', '.join(probs)}")
+    golpe, _ = _achados(re.sub(r"[^.!?\n]*\b(?:cuidado|golpe|desconfie|atencao)\b[^.!?\n]*", " ", texto),
+                        GOLPE_IMOVEL, [])
+    if golpe:
+        score -= 3
+        contras.append(f"padrão de golpe: {', '.join(golpe)}")
+        motivos.append("padrão de golpe")
+    positivos, negados = _achados(texto, POSITIVOS_IMOVEL, [])
+    if "semimobiliado" in positivos and "mobiliado" in positivos:
+        positivos.remove("mobiliado")
+    pros += positivos[:5]        # informam, não pontuam: piscina e elevador estão em quase todo anúncio
+    contras += [_NEGADOS_IMOVEL[n] for n in negados if n in _NEGADOS_IMOVEL]
+    garantias = [r for ch, r in GARANTIAS_IMOVEL if afirmado(texto, ch)]
+    if afirmado(texto, "fiador") is False:
+        pros.append("sem fiador")
+    if garantias:
+        obs.append(f"Garantia pedida: {', '.join(garantias)}")
+    negocia = any(afirmado(texto, c) for c in NEGOCIACAO)
+
+    bonus = 0
+    for modo, radicais, frase in regras:
+        if modo == "excluir":
+            continue
+        if _todos_afirmados(texto, radicais):
+            bonus += 1
+            pros.append(f"atende: {frase}")
+        elif modo == "exigir":
+            score -= 1
+            obs.append(f"Não informa: {frase} — pergunte")
+    score += min(2, bonus)
+    if sem_desc:
+        obs.append("Sem descrição — confirme o estado e as condições")
+
+    # ── preço: teto do usuário sobre o TOTAL; mediana do bairro (ou da cidade) ──
+    r = referencia_imovel(item) or {}
+    ref, n, escopo = r.get("mediana"), r.get("n", 0), r.get("escopo", "")
+    pct = round((total - ref) / ref * 100) if ref and total else None
+    avp, suspeita, onde = "sem_base", False, {"bairro": "do bairro", "cidade": "da cidade"}.get(escopo, "")
+    # cidade é referência aproximada (bairro barato fica 40% abaixo dela sem ser golpe)
+    lim_susp = -50 if escopo == "bairro" else -65
+    if not total:
+        obs.append("Preço a combinar")
+    elif teto and total > teto:
+        acima = round((total - teto) / teto * 100)
+        if preco <= teto:
+            obs.append(f"O aluguel cabe no seu teto, mas com condomínio/IPTU o total passa {acima}%")
+        if total <= teto * (1 + MARGEM_NEGOCIACAO) and negocia:
+            avp = "negociavel"
+            obs.append(f"Total {acima}% acima do seu teto, mas aceita proposta")
+            motivos.append("negociável até o seu teto")
+        elif total <= teto * (1 + MARGEM_SILENCIOSA):
+            score, avp = score - 1, "caro"
+            motivos.append(f"total {acima}% acima do seu teto")
+        else:
+            score, avp = min(score - 2, 4), "caro"
+            motivos.append(f"total {acima}% acima do seu teto de {_brl(teto)}")
+    elif pct is not None:
+        if pct < lim_susp:
+            avp, suspeita = "suspeito", True        # avisa com ⚠️ (nota no máx. 7): pode ser real
+            obs.append(f"{-pct}% abaixo da mediana {onde} ({_brl(ref)}): aluguel barato demais é o golpe "
+                       "mais comum — nunca pague nada antes de visitar o imóvel")
+            motivos.append("preço suspeito")
+        elif total <= r["q1"] and pct <= -5:
+            # entre os 25% mais baratos dos comparáveis (os 10%: destaque maior)
+            score, avp = score + (3 if r["p10"] and total <= r["p10"] else 2), "bom"
+            motivos.append(f"{-pct}% abaixo da mediana {onde}: entre os mais baratos dos comparáveis")
+        elif total <= r["q3"]:
+            score, avp = score + (1 if teto else 0), "justo"
+            motivos.append(f"preço normal {onde} ({pct:+d}%)")
+        else:
+            avp = "caro"
+            motivos.append(f"{pct}% acima da mediana {onde}: entre os mais caros dos comparáveis")
+    elif teto:
+        score += 1
+        motivos.append(f"dentro do seu teto de {_brl(teto)}, sem referência de mercado")
+
+    if modelo:
+        delta, porque = modelo.ajuste({**item, "avaliacao_preco": avp})
+        if delta:
+            score += delta
+            (pros if delta > 0 else contras).append(porque)
+            motivos.append(porque)
+    if item.get("feedback") == 1:
+        pros.insert(0, "você marcou 👍")
+        if descartado:
+            obs.append(f"As regras descartariam ({descartado}) — mantido pelo seu 👍")
+    if probs or sem_desc or suspeita:
+        score = min(score, 7)
+    if golpe:
+        score = min(score, 4)
+    score = max(1, min(10, score))
+    rec = "COMPRAR" if score >= 8 and avp == "bom" else "VER" if score >= 5 else "IGNORAR"
+    cabe = bool(total) and (not teto or total <= teto)
+    alerta = ("" if golpe or rec == "IGNORAR"
+              else "suspeita" if suspeita
+              else "negociar" if avp == "negociavel" or (avp == "bom" and probs)
+              else "comprar" if avp == "bom"
+              else "novo" if teto and cabe
+              else "")
+    base = (f" ({pct:+d}% vs mediana {onde} {_brl(ref)}, {n} imóveis"
+            + (" de tamanho parecido)" if r.get("tamanho") else ")") if pct is not None
+            else " (sem referência de mercado)")
+    custo = f"{_brl(total)}" + ("" if venda else "/mês") + (f" ({detalhe})" if " + " in detalhe else "")
+    return Avaliacao(
+        decisao="APROVADO", resumo=f"{titulo[:70]} — {custo}{base}",
+        pros=pros, contras=contras, observacoes=obs, score=score,
+        preco_vs_mercado_pct=pct, avaliacao_preco=avp, recomendacao=rec, alerta=alerta,
+        referencia=escopo if pct is not None else "", custo=custo,
+        motivo="; ".join(motivos) or "confere com o seu filtro",
+    ).model_dump()
+
+
 # ── AVALIAÇÃO ─────────────────────────────────────────────
 
 def excluido(titulo: str, motivo: str) -> dict:
     return Avaliacao(decisao="EXCLUIDO", resumo=(titulo or "")[:80], score=1,
                      avaliacao_preco="sem_base", recomendacao="IGNORAR",
                      motivo=motivo).model_dump()
+
+
+def _veto_das_regras(item: dict, texto: str, regras: list) -> dict | None:
+    """Exclusão pelas regras do usuário ("sem X" afirmado, "só com X" negado)."""
+    titulo = item.get("titulo") or ""
+    for modo, radicais, frase in regras:
+        if modo == "excluir" and _todos_afirmados(texto, radicais):
+            return excluido(titulo, f"Critério do usuário: '{frase}'")
+        if modo == "exigir":
+            # "só com nota fiscal" + "não tenho nota fiscal" / "só 16gb" + placa de 8GB
+            mem = [r for r in radicais if re.fullmatch(r"\d+(?:gb|tb)", r)]
+            v = variante(titulo, item.get("atributos"))
+            if (mem and v and v not in mem) or any(_afirmado_regra(texto, r) is False for r in radicais):
+                return excluido(titulo, f"Critério do usuário: '{frase}' (o anúncio diz que não)")
+    return None
 
 
 def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = None) -> dict:
@@ -761,15 +1161,10 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
     # o que o próprio usuário pede não é defeito ("rtx 3090 com defeito")
     procurado = [norm(item.get("termo"))] + [f for m, _, f in regras if m != "excluir"]
 
-    for modo, radicais, frase in regras:
-        if modo == "excluir" and _todos_afirmados(texto, radicais):
-            return excluido(titulo, f"Critério do usuário: '{frase}'")
-        if modo == "exigir":
-            # "só com nota fiscal" + "não tenho nota fiscal" / "só 16gb" + placa de 8GB
-            mem = [r for r in radicais if re.fullmatch(r"\d+(?:gb|tb)", r)]
-            v = variante(titulo, item.get("atributos"))
-            if (mem and v and v not in mem) or any(_afirmado_regra(texto, r) is False for r in radicais):
-                return excluido(titulo, f"Critério do usuário: '{frase}' (o anúncio diz que não)")
+    if (veto := _veto_das_regras(item, texto, regras)):
+        return veto
+    if item.get("tipo") == "imovel":
+        return avaliar_imovel(item, texto, regras, modelo, None if ok else motivo)
 
     score, pros, contras, obs, motivos = 6, [], [], [], []
     # "Troco rtx 5060 por rx 9060xt": quem anuncia quer OUTRA coisa, não dinheiro.
@@ -859,7 +1254,8 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
     teto = item.get("preco_max") or 0
     ref, n = referencia_preco(item, comparaveis)
     pct, avp, forte, suspeita = None, "sem_base", False, False
-    barato_ok = condicao == "defeito" or bool(graves)     # quebrado barato é coerente
+    # quebrado barato é coerente; "com problema na vram" a -60% também (não é golpe)
+    barato_ok = condicao == "defeito" or bool(graves or moderados)
     ref_m, n_m = referencia_mercado(item) if condicao != "defeito" else (None, 0)
     vs_mercado = bool(teto and 0 < preco <= teto and ref_m)
     if vs_mercado:
@@ -882,7 +1278,9 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
                 sinais = [r for r, ok in (
                     ("contato fora da OLX", bool(_RE_CONTATO.search(texto))),
                     ("pressa p/ vender", any(afirmado(texto, k) for k in _PRESSA)),
-                    ("descrição curta", sem_desc or len(desc) < 80)) if ok]
+                    ("descrição curta", sem_desc or len(desc) < 80),
+                    # produto novo bem abaixo do preço do USADO: isca clássica
+                    ("lacrado a preço de usado", bool(afirmado(texto, "lacrad")))) if ok]
                 suspeita = metade or bool(sinais)
                 obs.append(f"{-pct}% abaixo do mercado" + (
                     f" e {', '.join(sinais)}: padrão comum de golpe" if sinais
@@ -939,6 +1337,11 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
             score, avp = score - (1 if pct <= 35 else 2), "caro"
             motivos.append(f"{pct}% acima da mediana")
 
+    if gmax == 2 and vs_mercado and pct < MERCADO_SUSPEITO:       # só com mercado medido: teto folgado não é sinal
+        # ressalva "moderada" a preço de sucata: o preço diz que o problema é sério.
+        # Antes saía como PECHINCHA SUSPEITA ("Rtx 3060 com problema na vram", -60%)
+        gmax = 3
+        motivos.append("preço de peça com problema declarado")
     if modelo:
         delta, porque = modelo.ajuste({**item, "avaliacao_preco": avp})
         if delta:
@@ -998,24 +1401,48 @@ def avaliar(item: dict, comparaveis: list[dict], modelo: Classificador | None = 
 
 # ── FILA ──────────────────────────────────────────────────
 
+def _inicio(desc) -> str:
+    """Começo da descrição, normalizado ('' se curta demais p/ identificar)."""
+    t = re.sub(r"[^a-z0-9]+", " ", norm(desc)).strip()
+    return t[:60] if len(t) >= 60 else ""
+
+
 def republicacao(item: dict) -> tuple[int | None, bool]:
-    """(id do anúncio já alertado de que este parece cópia, certeza). Mesmo local,
-    preço igual ou maior e título quase igual (80% das palavras) em 14 dias =
-    republicação CERTA: vendedor apaga e posta de novo p/ subir na lista (sem isto,
-    3 reposts em 1 h = 3 alertas). Só o mesmo bairro e preço em 24 h, com outro
-    título, pode ser OUTRO vendedor (cidade grande, preço que se agrupa): alerta,
-    avisando — antes calava e perdia anúncio legítimo. Título curto ("RTX 5060")
-    não identifica vendedor: não conta como certeza."""
+    """(id do anúncio já alertado de que este parece cópia, certeza), em 14 dias e
+    na mesma faixa de preço. CERTA (sem alerta):
+      · mesmo local e título quase igual (80% das palavras): o vendedor apaga e
+        posta de novo p/ subir na lista (3 reposts em 1 h eram 3 alertas);
+      · descrição que começa igual, ao mesmo preço, em QUALQUER bairro: o vendedor
+        em série troca título e bairro, mas cola o mesmo texto;
+      · 3º anúncio no mesmo bairro e preço: vendedor em série (um deles rendeu 6
+        alertas em 2 dias, 2 por rodada). Não vale p/ imóvel: vários aluguéis de
+        mesmo preço no mesmo bairro é o normal.
+    FRACA (alerta com aviso): só o mesmo bairro e preço em 24 h, com outro título —
+    pode ser OUTRO vendedor. Título curto ("RTX 5060") não identifica ninguém."""
     palavras = lambda t: set(re.findall(r"[a-z0-9]+", norm(t)))
-    alvo, fraco = palavras(item.get("titulo")), None
-    for c in db.alertados_mesmo_local(item["busca_id"], item["anuncio_id"],
-                                      item.get("local"), item.get("preco")):
+    alvo, ini, preco = palavras(item.get("titulo")), _inicio(item.get("descricao")), item.get("preco") or 0
+    cands = db.alertados_parecidos(item["busca_id"], item["anuncio_id"], preco)
+    imovel, uf = item.get("tipo") == "imovel", lambda u: re.sub(r"^https?://", "", u or "")[:3]
+    if imovel:
+        # título de aluguel é quase sempre igual ("Apartamento 2 quartos no Bairro X") e
+        # imobiliária abre todo anúncio com o mesmo parágrafo: só é o MESMO imóvel se a
+        # ficha (área, quartos, vagas, condomínio) também for igual
+        cands = [c for c in cands if dados_imovel(c) == dados_imovel(item)]
+    for c in cands:
+        # mesmo estado (subdomínio da URL): texto do fabricante colado por vendedores
+        # de estados diferentes não é o mesmo vendedor
+        if ini and c["preco"] == preco and _inicio(c["descricao"]) == ini and uf(c["url"]) == uf(item.get("url")):
+            return c["id"], True
+    mesmos = [c for c in cands if item.get("local") and c["local"] == item["local"]]
+    for c in mesmos:
         outro = palavras(c["titulo"])
         if len(alvo) >= 4 and len(alvo & outro) >= 0.8 * len(alvo | outro):
             return c["id"], True
-        if c["recente"] and fraco is None:
-            fraco = c["id"]
-    return fraco, False
+    if imovel:
+        return None, False
+    if len(mesmos) >= 2:
+        return mesmos[0]["id"], True
+    return next((c["id"] for c in mesmos if c["recente"]), None), False
 
 
 ultimo_processamento: str | None = None
@@ -1046,8 +1473,9 @@ async def processar_fila(notifier=None):
                 bid = item["busca_id"]
                 try:
                     if bid not in comparaveis:
-                        comparaveis[bid] = [c for c in db.anuncios_comparaveis(bid)
-                                            if identidade(item.get("termo") or "", c)[0]]
+                        # imóvel compara com a amostra do mercado, não com os coletados
+                        comparaveis[bid] = [] if item.get("tipo") == "imovel" else [
+                            c for c in db.anuncios_comparaveis(bid) if triagem(item, c)[0]]
                     salvar.append((item, avaliar(item, comparaveis[bid], modelo)))
                 except Exception:
                     logger.exception(f"falha avaliando anúncio {item['anuncio_id']}")
@@ -1084,7 +1512,8 @@ async def processar_fila(notifier=None):
         for item, av in sorted(alertas, key=lambda x: -x[1]["score"]):     # os melhores primeiro
             r = por_busca[item["busca_id"]]
             orig, certa = republicacao(item)
-            if not certa and chave(item) in enviados_agora and item.get("local"):
+            if not certa and chave(item) in enviados_agora and item.get("local") \
+                    and item.get("tipo") != "imovel":
                 orig, certa = enviados_agora[chave(item)], True
             if orig and not certa:
                 av = {**av, "observacoes": ["Mesmo bairro e preço de um anúncio enviado há menos de "

@@ -94,6 +94,44 @@
           <label>Preço máx (R$)</label>
           <input type="number" id="f-preco-max" value="0" min="0">
         </div>
+        <div class="form-group full" id="grupo-imovel" hidden>
+          <label>Imóvel <span class="hint">(o preço máx vale para o total do mês: aluguel + condomínio + IPTU; estado é obrigatório)</span></label>
+          <div class="form-grid">
+            <div class="form-group">
+              <label>Negócio</label>
+              <select id="f-im-negocio"><option value="aluguel">Aluguel</option><option value="venda">Venda</option></select>
+            </div>
+            <div class="form-group">
+              <label>Tipo de imóvel</label>
+              <select id="f-im-imovel">
+                <option value="qualquer">Apartamento ou casa</option>
+                <option value="apartamento">Apartamento</option>
+                <option value="casa">Casa</option>
+                <option value="quarto">Quarto</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Cidade</label>
+              <input type="text" id="f-im-cidade" placeholder="Ex: Campinas">
+            </div>
+            <div class="form-group">
+              <label>Bairros <span class="hint">(por vírgula)</span></label>
+              <input type="text" id="f-im-bairros" placeholder="Ex: Centro, Cambuí">
+            </div>
+            <div class="form-group">
+              <label>Quartos (mín)</label>
+              <input type="number" id="f-im-quartos_min" min="0" max="5">
+            </div>
+            <div class="form-group">
+              <label>Vagas (mín)</label>
+              <input type="number" id="f-im-vagas_min" min="0" max="5">
+            </div>
+            <div class="form-group">
+              <label>Área útil mín (m²)</label>
+              <input type="number" id="f-im-area_min" min="0">
+            </div>
+          </div>
+        </div>
         <div class="form-group">
           <label>Filtro de envio</label>
           <select id="f-envio">

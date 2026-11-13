@@ -1,12 +1,13 @@
 """Canário contra a OLX REAL: pega mudança de layout/bloqueio que teste
 sintético não vê (o flight data morreu em runtime e o bot passou meses
 raspando ~5 de 50 anúncios por página sem ninguém notar).
-Uso: ./venv/bin/python test_live_olx.py   (~30 s, ~13 requisições)"""
+Uso: ./venv/bin/python test_live_olx.py   (~1 min, ~30 requisições)"""
 import asyncio
 import re
 import tempfile
 from pathlib import Path
 
+import avaliador
 import database
 import scheduler as s
 
@@ -64,6 +65,47 @@ async def main():
         desc = s.extrair_descricao((await s._baixar(sessao, ads[0]["url"])).text)
         assert len(desc) > 10, "descrição vazia — JSON-LD do anúncio mudou?"
         print(f"OK descrição: {desc[:60]!r}")
+
+        # "&_rsc" já na URL: a OLX tem de responder direto, sem o 307 (1 requisição por página)
+        u = s._montar_url({"termo": "geladeira"}, 1) + "&_rsc"
+        r = await sessao.get(u, timeout=30, headers={"RSC": "1"}, allow_redirects=False)
+        assert r.status_code == 200 and "x-component" in r.headers.get("content-type", ""), \
+            f"&_rsc não evita mais o redirecionamento: HTTP {r.status_code}"
+        print("OK &_rsc: resposta direta, sem redirecionamento")
+
+        # imóveis: cidade e bairro no caminho (a OLX tem de ECOAR o local, senão ignorou),
+        # quartos/vagas como lista, e a ficha com condomínio, área e quartos
+        b = {"tipo": "imovel", "estado": "sp", "termo": "", "preco_max": 4000,
+             "filtros_extra": {"cidade": "São Paulo", "imovel": "apartamento", "quartos_min": 2, "vagas_min": 1}}
+        ads = await s._pagina_de_busca(sessao, s._montar_url(b, 1), exige="loc_")
+        assert ads and len(ads) >= 40, f"aluguel: {ads and len(ads)} anúncios"
+        fichas = [avaliador.dados_imovel(x) for x in ads]
+        assert all(x["categoria"] == "Apartamentos (aluguel)" for x in ads), {x["categoria"] for x in ads}
+        assert all(f["cidade"] == "sao paulo" and f["quartos"] >= 2 and f["vagas"] >= 1 for f in fichas), fichas[:3]
+        assert sum(1 for f in fichas if f["cond"] and f["area"]) > 0.6 * len(ads), "condomínio/área sumiram da ficha"
+        assert all(0 < x["preco"] <= 4600 for x in ads) and len(s.filtrar_produtos(b, ads)) == len(ads)
+        print(f"OK aluguel: {len(ads)} apartamentos na cidade, 2+ quartos, 1+ vaga, ficha completa")
+        b["filtros_extra"]["bairros"] = ["Moema"]
+        ads = await s._pagina_de_busca(sessao, s._montar_url(b, 1), exige="loc_")
+        assert ads and all(avaliador.dados_imovel(x)["bairro"] == "moema" for x in ads), "bairro na URL não filtrou"
+        print(f"OK aluguel por bairro: {len(ads)} anúncios, todos no bairro")
+        try:
+            await s._pagina_de_busca(sessao, s._montar_url({**b, "filtros_extra": {"cidade": "Cidade Que Nao Existe"}}, 1),
+                                     exige="loc_")
+            raise AssertionError("cidade inexistente passou sem erro")
+        except AssertionError:
+            raise
+        except Exception as e:      # a OLX ora ignora o local (LocalDesconhecido), ora devolve 5xx
+            print(f"OK cidade inexistente: {type(e).__name__} em vez do estado inteiro")
+        desc = s.extrair_descricao((await s._baixar(sessao, ads[0]["url"])).text)
+        assert len(desc) > 10, "descrição do imóvel vazia"
+
+    bid = database.criar_busca({"nome": "canário aluguel", "tipo": "imovel", "termo": "", "estado": "sp",
+                                "filtros_extra": {"cidade": "São Paulo", "imovel": "apartamento", "quartos_min": 2}})
+    await s._atualizar_mercado(database.obter_busca(bid))
+    m = database.obter_busca(bid)["mercado"]
+    assert m.get("amostras") and m["n"] >= 100 and 1500 < m["mediana"] < 20000, f"mercado de aluguel: {str(m)[:200]}"
+    print(f"OK mercado de aluguel: {m['n']} imóveis em {len(m['amostras'])} grupos, custo mediano R$ {m['mediana']}")
 
     # mediana do mercado: a busca SEM o teto, como o bot mede 1x/dia
     bid = database.criar_busca({"nome": "canário mercado", "termo": "rtx 3090", "preco_max": 6000})

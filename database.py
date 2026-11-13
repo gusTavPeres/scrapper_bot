@@ -387,10 +387,11 @@ def mercado_vencido(busca_id: int) -> bool:
     relógio voltou)."""
     with get_conn() as conn:
         # CASE: json_extract em '' dá erro de JSON e o SQL não garante curto-circuito
-        r = conn.execute("""SELECT CASE WHEN preco_max > 0 AND json_valid(mercado) THEN COALESCE(
+        r = conn.execute("""SELECT CASE WHEN (preco_max > 0 OR tipo = 'imovel') AND json_valid(mercado)
+                            THEN COALESCE(
                                 json_extract(mercado, '$.em') <= datetime('now', '-1 day')
                                 OR json_extract(mercado, '$.em') > datetime('now', '+10 minutes'), 1)
-                            ELSE preco_max > 0 END
+                            ELSE preco_max > 0 OR tipo = 'imovel' END
                             FROM buscas WHERE id=?""", (busca_id,)).fetchone()
         return bool(r and r[0])
 
@@ -554,7 +555,8 @@ def obter_fila_pendente(limite: int = 5000) -> list[dict]:
                    (a.ultima_vez >= datetime('now','-2 days')) AS ativo,
                    (SELECT gostou FROM feedback fb WHERE fb.anuncio_id = a.id) AS feedback,
                    b.termo, b.tipo, b.criterios_inclusao, b.criterios_exclusao,
-                   b.nome, b.instrucoes, b.condicao, b.categorias, b.preco_max, b.mercado
+                   b.nome, b.instrucoes, b.condicao, b.categorias, b.preco_max, b.mercado,
+                   b.filtros_extra
             FROM fila f
             JOIN anuncios a ON a.id = f.anuncio_id
             JOIN buscas   b ON b.id = f.busca_id
@@ -591,7 +593,7 @@ def anuncios_comparaveis(busca_id: int) -> list[dict]:
     notebooks e outros modelos: R$3.691 vs R$12.017 reais numa busca de 4090)."""
     with get_conn() as conn:
         rows = conn.execute("""
-            SELECT id, titulo, atributos, descricao, preco, categoria FROM anuncios
+            SELECT id, titulo, atributos, descricao, preco, categoria, local FROM anuncios
             WHERE busca_id=? AND preco > 0 AND ultima_vez >= datetime('now','-30 days')
         """, (busca_id,)).fetchall()
         return [dict(r) for r in rows]
@@ -646,18 +648,20 @@ def analise_de(anuncio_id: int) -> dict | None:
         return dict(r) if r else None
 
 
-def alertados_mesmo_local(busca_id: int, anuncio_id: int, local: str, preco: float) -> list[dict]:
-    """Já alertados da busca nos últimos 14 dias, mesmo local e preço até 10%
-    abaixo ou 3% acima: candidatos a 'o mesmo anúncio, republicado'. Repostado
-    3%+ mais barato é novidade (mesmo limiar do alerta de queda): fica de fora."""
-    if not local or not preco:
+def alertados_parecidos(busca_id: int, anuncio_id: int, preco: float) -> list[dict]:
+    """Já alertados da busca nos últimos 14 dias com preço até 10% abaixo ou 3%
+    acima: candidatos a 'o mesmo anúncio, republicado' (quem decide é
+    avaliador.republicacao). Repostado 3%+ mais barato é novidade (mesmo limiar
+    do alerta de queda): fica de fora."""
+    if not preco:
         return []
     with get_conn() as conn:
         return [dict(r) for r in conn.execute("""
-            SELECT id, titulo, primeira_vez >= datetime('now', '-1 day') AS recente FROM anuncios
-            WHERE busca_id=? AND id!=? AND notificado=1 AND local=?
+            SELECT id, titulo, local, preco, url, atributos, substr(descricao, 1, 300) AS descricao,
+                   primeira_vez >= datetime('now', '-1 day') AS recente FROM anuncios
+            WHERE busca_id=? AND id!=? AND notificado=1
               AND preco BETWEEN ? AND ? AND primeira_vez >= datetime('now','-14 days')
-        """, (busca_id, anuncio_id, local, preco * 0.9, preco * 1.03))]
+        """, (busca_id, anuncio_id, preco * 0.9, preco * 1.03))]
 
 
 def marcar_notificado(anuncio_id: int):

@@ -16,7 +16,7 @@ UFS = {"ac", "al", "ap", "am", "ba", "ce", "df", "es", "go", "ma", "mt", "ms", "
 
 
 _NOMES = {"preco_min": "preço mínimo", "preco_max": "preço máximo", "intervalo_min": "intervalo",
-          "filtro_envio": "envio", "filtro_vendedor": "vendedor", "filtros_extra": "filtros de carro",
+          "filtro_envio": "envio", "filtro_vendedor": "vendedor", "filtros_extra": "filtros de carro/imóvel",
           "criterios_inclusao": "critérios de inclusão", "criterios_exclusao": "critérios de exclusão",
           "instrucoes": "regras"}
 
@@ -55,9 +55,12 @@ class Avaliacao(BaseModel):
     motivo:              str
     # o que vira alerta no Telegram: "comprar" (🟢) ou "negociar" (🟡: o preço
     # compensa uma ressalva); "" não notifica
-    alerta:              Literal["", "comprar", "negociar", "suspeita"] = ""
+    # "novo" (imóvel): anúncio novo que cabe no teto e nos filtros, a preço normal
+    alerta:              Literal["", "comprar", "negociar", "suspeita", "novo"] = ""
     # contra o quê o preco_vs_mercado_pct foi medido (rótulo do alerta; não vai p/ o banco)
-    referencia:          Literal["", "teto", "mercado"] = ""
+    referencia:          Literal["", "teto", "mercado", "bairro", "cidade"] = ""
+    # imóvel: "R$ 3.264/mês (aluguel R$ 2.350 + cond. R$ 500 + IPTU R$ 414)" (não vai p/ o banco)
+    custo:               str = ""
 
     @model_validator(mode="after")
     def coerencia_recomendacao(self):
@@ -132,11 +135,39 @@ class _Validacoes(BaseModel):
             return v
         if isinstance(v, str):
             v = json.loads(v or "{}")
-        if not isinstance(v, dict) or set(v) - {"ano_min", "ano_max", "km_max", "motor"}:
-            raise ValueError("filtros_extra aceita só ano_min, ano_max, km_max, motor")
+        if not isinstance(v, dict) or set(v) - _EXTRAS_CARRO - _EXTRAS_IMOVEL:
+            raise ValueError("filtros_extra aceita só " + ", ".join(sorted(_EXTRAS_CARRO | _EXTRAS_IMOVEL)))
         v = dict(v)
+        for k, opcoes in (("negocio", ("aluguel", "venda")),
+                          ("imovel", ("apartamento", "casa", "quarto", "qualquer"))):
+            if k in v and v[k] not in opcoes:
+                raise ValueError(f"{k} deve ser um de: {', '.join(opcoes)}")
+        if "cidade" in v:
+            if not isinstance(v["cidade"], str):
+                raise ValueError("cidade inválida (use o nome, ex.: Campinas)")
+            v["cidade"] = re.sub(r"\s+", " ", str(v["cidade"]).replace("_", " ")).strip()
+            if not re.fullmatch(r"[^\W\d_](?:[^\W\d_]|[ '.-]){1,59}", v["cidade"]):
+                raise ValueError("cidade inválida (use o nome, ex.: Campinas)")
+        if "bairros" in v:
+            b = v["bairros"].split(",") if isinstance(v["bairros"], str) else v["bairros"]
+            if not isinstance(b, list) or not all(isinstance(x, str) for x in b):
+                raise ValueError("bairros deve ser uma lista de nomes")
+            v["bairros"] = [re.sub(r"\s+", " ", str(x).replace("_", " ")).strip() for x in b if str(x).strip()]
+            if len(v["bairros"]) > 10 or any(not 2 <= len(x) <= 60 or not re.search(r"[^\W\d_]{2}", x)
+                                             for x in v["bairros"]):
+                raise ValueError("bairros: até 10 nomes, cada um com 2 a 60 letras")
+            if not v["bairros"]:
+                del v["bairros"]
         # número vindo como texto ("2011") era gravado como texto e todo scan
         # quebrava comparando int com str: a busca ficava em erro p/ sempre
+        for k, maximo in (("quartos_min", 5), ("vagas_min", 5), ("area_min", 10_000)):
+            if k in v:
+                try:
+                    v[k] = int(v[k])
+                except (TypeError, ValueError, OverflowError):
+                    raise ValueError(f"{k} deve ser um número inteiro") from None
+                if not 1 <= v[k] <= maximo:
+                    raise ValueError(f"{k} fora de 1-{maximo}")
         for k in ("ano_min", "ano_max", "km_max"):
             if k in v:
                 try:
@@ -153,6 +184,33 @@ class _Validacoes(BaseModel):
         if "motor" in v and not re.fullmatch(r"\d\.\d", str(v["motor"])):
             raise ValueError("motor deve ser como 1.8")
         return v
+
+
+_EXTRAS_CARRO = {"ano_min", "ano_max", "km_max", "motor"}
+_EXTRAS_IMOVEL = {"negocio", "imovel", "cidade", "bairros", "quartos_min", "vagas_min", "area_min"}
+
+
+def incoerencia(b: dict) -> str | None:
+    """Regras entre campos, as mesmas ao criar e ao editar (None = tudo certo)."""
+    extras, tipo = b.get("filtros_extra") or {}, b.get("tipo")
+    if b.get("preco_min") and b.get("preco_max") and b["preco_min"] > b["preco_max"]:
+        return "preço mínimo maior que o preço máximo"
+    if set(extras) & (_EXTRAS_IMOVEL if tipo != "imovel" else _EXTRAS_CARRO):
+        return f"esses filtros não valem para busca de {tipo}"
+    if tipo == "imovel":
+        # cidade só existe dentro de um estado; o Brasil inteiro são centenas de
+        # milhares de anúncios e o scan só alcança os 1.250 mais novos
+        if (b.get("estado") or "brasil") == "brasil":
+            return "busca de imóvel exige o estado (ex.: estado=go)"
+        if extras.get("bairros") and not extras.get("cidade"):
+            return "bairros exigem a cidade"
+        return None
+    if not b.get("termo") and tipo != "carro":
+        return "termo obrigatório (só carro e imóvel aceitam busca sem termo)"
+    if not b.get("termo") and not (extras or b.get("preco_min") or b.get("preco_max")):
+        # mesma regra do /addcarro: "todos os carros do Brasil" sem filtro nenhum não
+        return "busca de carros sem modelo exige ao menos um filtro (ano, km, motor ou preço)"
+    return None
 
 
 class BuscaCreate(_Validacoes):
@@ -182,13 +240,10 @@ class BuscaCreate(_Validacoes):
                         _sem_acento(f"{self.termo}. {'. '.join(self.criterios_inclusao)}"))
         if "condicao" not in self.model_fields_set and _RE_QUER_DEFEITO.search(pedido):
             self.condicao = "defeito"
-        if not self.termo and self.tipo != "carro":
-            raise ValueError("termo obrigatório (só carro aceita busca sem modelo)")
-        if not self.termo and not (self.filtros_extra or self.preco_min or self.preco_max):
-            # mesma regra do /addcarro: "todos os carros do Brasil" sem filtro nenhum não
-            raise ValueError("busca de carros sem modelo exige ao menos um filtro (ano, km, motor ou preço)")
-        if self.preco_min and self.preco_max and self.preco_min > self.preco_max:
-            raise ValueError("preco_min maior que preco_max")
+        if self.tipo == "imovel":
+            self.condicao = "funcionando"          # "apartamento para reforma" não é "peça com defeito"
+        if (erro := incoerencia(self.model_dump())):
+            raise ValueError(erro)
         return self
 
 

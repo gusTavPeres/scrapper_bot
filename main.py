@@ -38,7 +38,7 @@ import avaliador
 import database as db
 import scheduler
 import telegram_bot
-from models import FUSO, BuscaCreate, BuscaUpdate, Feedback, mensagem_erro
+from models import FUSO, BuscaCreate, BuscaUpdate, Feedback, incoerencia, mensagem_erro
 
 logging.basicConfig(
     level=logging.INFO,
@@ -221,12 +221,8 @@ async def atualizar_busca(bid: int, dados: BuscaUpdate, _=Depends(verificar_auth
     atual = _busca_ou_404(bid)
     campos = dados.model_dump(exclude_none=True)
     final = {**atual, **campos}            # coerência vale p/ o resultado da edição
-    if final["preco_min"] and final["preco_max"] and final["preco_min"] > final["preco_max"]:
-        raise HTTPException(422, "preço mínimo maior que o preço máximo")
-    if not final["termo"] and final["tipo"] != "carro":
-        raise HTTPException(422, "termo obrigatório (só carro aceita busca sem modelo)")
-    if not final["termo"] and not (final.get("filtros_extra") or final["preco_min"] or final["preco_max"]):
-        raise HTTPException(422, "busca de carros sem modelo exige ao menos um filtro (ano, km, motor ou preço)")
+    if (erro := incoerencia(final)):
+        raise HTTPException(422, erro)
     mudou = db.atualizar_busca(bid, campos)
     await broadcast({"tipo": "busca_status", "busca_id": bid})
     return {"ok": True, "alterados": sorted(mudou)}
