@@ -1737,7 +1737,8 @@ async def processar_fila(notifier=None):
                     continue
                 r = por_busca.setdefault(item["busca_id"], {
                     "nome": item.get("nome", "?"), "n": 0, "comprar": 0, "ver": 0,
-                    "alertas": 0, "sem_alerta": 0, "cats": {}, "filtrada": bool(_lista(item.get("categorias")))})
+                    "alertas": 0, "sem_alerta": 0, "cats": {}, "filtrada": bool(_lista(item.get("categorias"))),
+                    "imovel": item.get("tipo") == "imovel"})
                 r["n"] += 1
                 r["comprar"] += av["recomendacao"] == "COMPRAR"
                 r["ver"] += av["recomendacao"] == "VER"

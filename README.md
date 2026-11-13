@@ -103,7 +103,9 @@ Telegram: `/add rtx 5060 max=1.900`, `/add rtx 3090 com defeito`,
 `/addaluguel estado=sp cidade=campinas bairro=centro,cambui quartos=2 vagas=1 max=3000 obs= aceita pet`,
 `/buscas`, `/top`, `/categorias <id>`,
 `/scan <id>`, `/pausar <id>`, `/del <id> sim`, `/help`.
-O painel web faz o mesmo e mostra o detalhe de cada avaliação.
+O painel web faz o mesmo e mostra o detalhe de cada avaliação. Produtos, carros
+e imóveis ficam separados: abas no painel, blocos no `/buscas` e no `/top`, e o
+alerta de imóvel começa com "🏠 ALUGUEL".
 
 ## Segurança
 
@@ -115,6 +117,6 @@ para aceitar só conexões da própria máquina). Segredos ficam só no `.env`
 ## Testes
 
 ```bash
-./venv/bin/python test_offline.py      # 103 testes de regressão (não usam rede nem o banco real)
+./venv/bin/python test_offline.py      # 104 testes de regressão (não usam rede nem o banco real)
 ./venv/bin/python test_live_olx.py     # canário contra a OLX real (layout, RSC, ordem, aluguel)
 ```

@@ -121,20 +121,34 @@ function rotuloStatus(b) {
   return b.fase === "scan" ? ["badge-scan", "SCAN"] : ["badge-monitor", "MONITOR"];
 }
 
+// produto, carro e imóvel não se misturam: uma aba por modalidade (lembrada no navegador)
+const MODALIDADES = [["produto", "🛒 Produtos"], ["carro", "🚗 Carros"], ["imovel", "🏠 Imóveis"]];
+let modalidade = localStorage.getItem("modalidade") || "";
+
+function escolherModalidade(tipo) {
+  modalidade = tipo;
+  localStorage.setItem("modalidade", tipo);
+  renderSidebar();
+}
+
 function renderSidebar() {
   const container = document.getElementById("lista-buscas");
   if (!buscas.length) {
     container.innerHTML = '<div class="empty-state">Nenhuma busca criada.</div>';
     return;
   }
-  container.innerHTML = buscas.map(b => {
+  const comBusca = MODALIDADES.filter(([t]) => buscas.some(b => b.tipo === t));
+  if (!comBusca.some(([t]) => t === modalidade)) modalidade = comBusca[0]?.[0] || "produto";
+  const abas = comBusca.length < 2 ? "" : `<div class="abas-modalidade">${comBusca.map(([t, nome]) => `
+      <button class="aba-modalidade ${t === modalidade ? 'ativa' : ''}" onclick="escolherModalidade('${t}')">
+        ${nome} <span class="hint">${buscas.filter(b => b.tipo === t).length}</span></button>`).join("")}</div>`;
+  container.innerHTML = abas + buscas.filter(b => b.tipo === modalidade).map(b => {
     const [cls, label] = rotuloStatus(b);
     return `
     <div class="busca-item ${b.id == buscaAtiva ? 'ativo' : ''}" onclick="selecionarBusca(${Number(b.id)})">
       <div class="busca-item-nome">${esc(b.nome)}</div>
       <div class="busca-item-meta">
         <span class="badge ${cls}">${label}</span>
-        <span class="badge" style="color:var(--text3);border-color:var(--border2)">${esc(b.tipo)}</span>
       </div>
       <div class="busca-item-contadores" style="margin-top:6px">
         <span class="cnt-comprar">▲${Number(b.total_comprar) || 0}</span>
@@ -266,7 +280,9 @@ function renderCard(a) {
           <div class="score-badge ${scoreClass}">${a.feedback === 1 ? '👍' : a.feedback === 0 ? '👎' : (score ?? '?')}</div>
         </div>
         <div class="anuncio-preco">${brl(a.preco)}${pctHtml}</div>
-        <div class="anuncio-meta">${esc(a.local)} · ${esc(a.envio)}${vend}</div>
+        <div class="anuncio-meta">${esc(a.local)}${a.categoria && /aluguel|venda/.test(a.categoria) ? "" : " · " + esc(a.envio)}${vend}</div>
+        <a class="anuncio-link" href="${urlSegura(a.url)}" target="_blank" rel="noopener noreferrer"
+           onclick="event.stopPropagation()">Abrir anúncio na OLX ↗</a>
       </div>
     </div>
     ${a.motivo ? `<div class="anuncio-resumo">${esc(a.motivo)}</div>` : ''}

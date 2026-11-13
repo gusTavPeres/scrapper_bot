@@ -91,6 +91,7 @@ _HELP = (
     "💸 queda de preço. Os botões 👍/👎 dos alertas ensinam o bot."
 )
 
+_MODALIDADES = (("produto", "🛒 Produtos"), ("carro", "🚗 Carros"), ("imovel", "🏠 Imóveis"))
 _ENVIO = {"gratis": "frete_gratis", "frete": "frete_gratis", "frete_gratis": "frete_gratis",
           "com_envio": "com_envio", "sem_envio": "sem_envio", "qualquer": "qualquer"}
 _GARANTIA = {"olx": "pay", "sim": "pay", "entrega": "pay_entrega", "nao": "", "não": ""}
@@ -230,13 +231,19 @@ def tratar_comando(texto: str) -> str:
         buscas = db.listar_buscas()
         if not buscas:
             return "Nenhuma busca criada. Use /add &lt;termo&gt;."
-        return "\n".join(
-            f"#{b['id']} <b>{esc(b['nome'])}</b> "
-            f"{b['status'] if b['status'] != 'ativa' else b['fase']} · "
-            f"🟢{b['total_comprar']} 🟡{b['total_ver']} ({b['total_anuncios']} anúncios)"
-            + (f" · mercado ~{avaliador._brl(m['mediana'])}"
-               if isinstance(m := b.get("mercado"), dict) and m.get("mediana") else "")
-            for b in buscas)
+        # por modalidade: produto, carro e imóvel não se misturam
+        linhas = []
+        for tipo, titulo in _MODALIDADES:
+            do_tipo = [b for b in buscas if b["tipo"] == tipo]
+            if do_tipo:
+                linhas += ([""] if linhas else []) + [f"<b>{titulo}</b>"] + [
+                    f"#{b['id']} <b>{esc(b['nome'])}</b> "
+                    f"{b['status'] if b['status'] != 'ativa' else b['fase']} · "
+                    f"🟢{b['total_comprar']} 🟡{b['total_ver']} ({b['total_anuncios']} anúncios)"
+                    + (f" · {'custo mediano' if tipo == 'imovel' else 'mercado'} ~{avaliador._brl(m['mediana'])}"
+                       if isinstance(m := b.get("mercado"), dict) and m.get("mediana") else "")
+                    for b in do_tipo]
+        return "\n".join(linhas)
 
     if cmd in ("add", "addcarro", "addaluguel", "addimovel"):
         tipo = {"add": "produto", "addcarro": "carro"}.get(cmd, "imovel")
@@ -306,15 +313,25 @@ def tratar_comando(texto: str) -> str:
                 bid = _id(partes[1])
             except ValueError:
                 return "Uso: /top [id da busca]"
-        tops = db.top_analises(bid)
+        tops = db.top_analises(bid, 8 if bid else 5)
         if not tops:
             return "Nenhum achado ativo (anúncios vistos nos últimos 2 dias)."
-        linhas = ["🏆 <b>Melhores achados ativos</b>\n"]
+        linhas, tipo = [], None
         for t in tops:
-            preco = f"{t['preco'] or 0:,.0f}".replace(",", ".")
-            linhas.append(f"{t['score']}/10 · <b>R$ {preco}</b> "
-                          f"({_PRECO_TXT.get(t['avaliacao_preco'], t['avaliacao_preco'])}) — "
-                          f"<a href=\"{esc(t['url'])}\">{esc((t['titulo'] or '?')[:45])}</a>")
+            if t["tipo"] != tipo:              # um bloco por modalidade
+                tipo = t["tipo"]
+                linhas += ([""] if linhas else []) + [f"🏆 <b>{dict(_MODALIDADES)[tipo]}</b>"
+                                                      + (f" — {esc(t['nome'])}" if bid else "")]
+            if tipo == "imovel":               # custo total do mês (vem no resumo da avaliação) e bairro
+                m = re.search(r" — (R\$ [\d.]+(?:/mês)?)", t.get("resumo") or "")
+                valor = m.group(1) if m else avaliador._brl(t["preco"] or 0)
+                onde = f" · {esc((t.get('local') or '').partition(', ')[2])}" if t.get("local") else ""
+            else:
+                valor, onde = avaliador._brl(t["preco"] or 0), ""
+            linhas.append(f"{t['score']}/10 · <b>{valor}</b> "
+                          f"({_PRECO_TXT.get(t['avaliacao_preco'], t['avaliacao_preco'])}){onde}\n"
+                          f"   {esc((t['titulo'] or '?')[:60])}\n"
+                          f"   🔗 <a href=\"{esc(t['url'])}\">abrir anúncio</a>")
         return "\n".join(linhas)
 
     if cmd == "categorias":

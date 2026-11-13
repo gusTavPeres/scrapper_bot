@@ -670,3 +670,13 @@ textarea { resize: vertical; min-height: 70px; }
   .resultados-grid { grid-template-columns: 1fr; }
   .modal { max-height: 100vh; border-radius: 0; }
 }
+
+/* abas de modalidade (produtos / carros / imóveis) e link do anúncio no cartão */
+.abas-modalidade { display: flex; gap: 4px; margin-bottom: 8px; flex-wrap: wrap; }
+.aba-modalidade {
+  flex: 1; padding: 6px 8px; font-size: 12px; cursor: pointer; white-space: nowrap;
+  background: transparent; color: var(--text2); border: 1px solid var(--border2); border-radius: var(--radius);
+}
+.aba-modalidade.ativa { color: var(--accent); border-color: var(--accent); }
+.anuncio-link { display: inline-block; margin-top: 4px; font-size: 12px; color: var(--accent); text-decoration: none; }
+.anuncio-link:hover { text-decoration: underline; }

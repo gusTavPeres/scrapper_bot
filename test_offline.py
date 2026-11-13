@@ -3692,6 +3692,44 @@ def test_p13_cadastro_do_ibge():
     assert "cep:74000003" not in linhas
 
 
+def test_p13_modalidades_separadas_e_links():
+    """Produto, carro e imóvel não se misturam: /buscas e /top saem em blocos, o
+    alerta de imóvel diz ALUGUEL na 1ª linha, e todo item do /top traz o link."""
+    novo_banco()
+    placa = criar(nome="rtx 3090", termo="rtx 3090", preco_max=6000)
+    carro = criar(nome="civic", termo="civic", tipo="carro")
+    ap = db.criar_busca({"nome": "aluguel centro", "tipo": "imovel", "termo": "", "estado": "go", "preco_max": 3000,
+                         "filtros_extra": {"cidade": "Cidade Alfa"}})
+    r = tb.tratar_comando("/buscas")
+    assert r.index("🛒 Produtos") < r.index("rtx 3090") < r.index("🚗 Carros") < r.index("civic") \
+        < r.index("🏠 Imóveis") < r.index("aluguel centro"), r
+    a1, _, _ = db.upsert_anuncio(placa, {"url": "https://x/placa-1", "titulo": "RTX 3090 Asus", "preco": 4000})
+    db.atualizar_descricao(a1, placa, _item()["descricao"])
+    a2, _, _ = db.upsert_anuncio(ap, _ap(lid=5, titulo="Apartamento 2 quartos amplo", aluguel=1800))
+    db.atualizar_descricao(a2, ap, "Apartamento com armários, sala ampla e cozinha planejada, em prédio com elevador.")
+    textos = []
+    notifier._post = lambda metodo, dados, timeout: bool(textos.append(dados.get("caption") or dados.get("text"))) or True
+    rodar(avaliador.processar_fila(notifier))
+    alug = next(t for t in textos if "Apartamento 2 quartos amplo" in t)
+    assert alug.startswith("🏠 ALUGUEL · ") and 'href="https://go.olx.com.br/x/anuncio-5"' in alug, alug
+    peca = next(t for t in textos if "RTX 3090 Asus" in t)
+    assert "ALUGUEL" not in peca and 'href="https://x/placa-1"' in peca, peca
+    top = tb.tratar_comando("/top")
+    assert top.index("🏆 <b>🛒 Produtos</b>") < top.index("RTX 3090 Asus") < top.index("🏆 <b>🏠 Imóveis</b>") \
+        < top.index("Apartamento 2 quartos amplo"), top
+    assert top.count("abrir anúncio</a>") == 2 and 'href="https://x/placa-1"' in top, top
+    assert "R$ 2.400/mês" in top and "Bairro Um" in top, top             # imóvel: custo total e bairro
+    so_ap = tb.tratar_comando(f"/top {ap}")
+    assert "Produtos" not in so_ap and "🏠 Imóveis</b> — aluguel centro" in so_ap and "anuncio-5" in so_ap, so_ap
+    # sem busca, 5 de CADA modalidade (uma enxurrada de aluguéis não esconde as peças)
+    for i in range(8):
+        aid, _, _ = db.upsert_anuncio(ap, _ap(lid=100 + i, titulo=f"Apartamento reformado {i}", aluguel=1500 + i))
+        db.atualizar_descricao(aid, ap, f"Unidade {i}: apartamento reformado, com armários e garagem coberta para um carro.")
+    rodar(avaliador.processar_fila(None))
+    top = tb.tratar_comando("/top")
+    assert "RTX 3090 Asus" in top and top.count("abrir anúncio</a>") == 6, top
+
+
 if __name__ == "__main__":
     import sys
     testes = [(n, f) for n, f in list(globals().items()) if n.startswith("test_")]

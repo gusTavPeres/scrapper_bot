@@ -811,20 +811,24 @@ def stats_busca(busca_id: int) -> dict:
 
 
 def top_analises(busca_id: int = None, n: int = 5) -> list[dict]:
-    """Top-N por score (p/ o /top do Telegram). Só anúncios ATIVOS: com o full
-    scan diário, quem não é visto há 2 dias provavelmente expirou."""
+    """Top-N por score (p/ o /top do Telegram): de uma busca, ou — sem busca — os
+    N de CADA modalidade (produto, carro, imóvel), que não se comparam. Só
+    anúncios ATIVOS: quem não é visto há 2 dias provavelmente expirou."""
     with get_conn() as conn:
         filtro = "AND a.busca_id=?" if busca_id else ""
         params = ([busca_id] if busca_id else []) + [n]
         rows = conn.execute(f"""
-            SELECT a.titulo, a.preco, a.url, a.vendedor, an.score, an.recomendacao,
-                   an.avaliacao_preco, b.nome
-            FROM analises an
-            JOIN anuncios a ON a.id = an.anuncio_id
-            JOIN buscas b ON b.id = a.busca_id
-            WHERE a.ultima_vez >= datetime('now', '-2 days')
-              AND an.decisao = 'APROVADO' {filtro}
-            ORDER BY an.score DESC, a.preco ASC LIMIT ?
+            SELECT * FROM (
+                SELECT a.titulo, a.preco, a.url, a.vendedor, a.local, an.score, an.recomendacao,
+                       an.avaliacao_preco, an.resumo, b.nome, b.tipo,
+                       ROW_NUMBER() OVER (PARTITION BY b.tipo ORDER BY an.score DESC, a.preco ASC) AS pos
+                FROM analises an
+                JOIN anuncios a ON a.id = an.anuncio_id
+                JOIN buscas b ON b.id = a.busca_id
+                WHERE a.ultima_vez >= datetime('now', '-2 days')
+                  AND an.decisao = 'APROVADO' {filtro})
+            WHERE pos <= ?
+            ORDER BY CASE tipo WHEN 'produto' THEN 0 WHEN 'carro' THEN 1 ELSE 2 END, pos
         """, params).fetchall()
         return [dict(r) for r in rows]
 

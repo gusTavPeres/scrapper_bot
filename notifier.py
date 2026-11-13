@@ -139,6 +139,8 @@ async def enviar_resultado(anuncio: dict, avaliacao: dict) -> bool:
                  }.get(avaliacao.get("alerta"), "🟢 <b>BOA OPÇÃO</b>" if imovel else f"{_REC_EMOJI.get(rec, '⚪')} <b>{rec}</b>")
     if imovel and avaliacao.get("alerta") == "suspeita":
         cabecalho = "⚠️ <b>BARATO DEMAIS</b> — padrão de golpe de aluguel: nunca pague antes de visitar"
+    if imovel:                                   # a modalidade na 1ª linha: não se confunde com as peças
+        cabecalho = "🏠 ALUGUEL · " + cabecalho
     linhas = [
         f"{cabecalho} — Score {avaliacao.get('score', 0)}/10",
         f"🔎 <b>{esc(anuncio.get('nome') or anuncio.get('termo'))}</b>",
@@ -175,7 +177,7 @@ async def enviar_queda(busca: dict, anuncio: dict, preco_antigo: float, anuncio_
 
 
 async def enviar_resumo(busca_id: int, r: dict) -> bool:
-    texto = (f"📊 <b>{esc(r['nome'])}</b> — {r['n']} anúncios avaliados\n"
+    texto = (f"📊 {'🏠 ' if r.get('imovel') else ''}<b>{esc(r['nome'])}</b> — {r['n']} anúncios avaliados\n"
              f"🟢 COMPRAR: {r['comprar']} · 🟡 VER: {r['ver']} · "
              f"🔴 ignorados: {r['n'] - r['comprar'] - r['ver']}\n")
     if r.get("sem_alerta"):
