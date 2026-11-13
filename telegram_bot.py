@@ -63,7 +63,10 @@ _AJUDA_ADDALUGUEL = (
     "<code>cidade=campinas</code> — espaço vira _ (sao_jose_dos_campos)\n"
     "<code>bairro=centro,cambui</code> — um ou vários, por vírgula\n"
     "<code>imovel=apartamento|casa|quarto|qualquer</code>\n"
-    "<code>quartos=2</code> · <code>vagas=1</code> · <code>area=50</code> — mínimos\n"
+    "<code>quartos=2</code> · <code>vagas=1</code> · <code>area=50</code> — mínimos "
+    "(<code>quartos=1-1</code> = só 1 quarto)\n"
+    "<code>perto=-23.55,-46.63 raio=8</code> — só bairros a até 8 km do ponto "
+    "(latitude,longitude; a distância é a do centro do bairro)\n"
     "<code>max=2500</code> — teto do total do mês · <code>min=800</code> — aluguel mínimo\n"
     "<code>vendedor=particular|loja</code> — particular = direto com o dono\n"
     "<code>negocio=venda</code> — imóveis à venda em vez de aluguel\n"
@@ -161,8 +164,14 @@ def _parse_add(args: list[str], tipo: str = "produto"):
                 extras[k] = v
             elif k in ("bairro", "bairros") and tipo == "imovel":
                 extras["bairros"] = v.split(",")
+            elif k == "quartos" and tipo == "imovel" and (m := re.fullmatch(r"(\d)-(\d)", v)):
+                extras["quartos_min"], extras["quartos_max"] = int(m.group(1)), int(m.group(2))
             elif k in ("quartos", "vagas", "area") and tipo == "imovel":
                 extras[f"{k}_min"] = _inteiro(v)
+            elif k == "perto" and tipo == "imovel":
+                extras["centro"] = v
+            elif k == "raio" and tipo == "imovel":
+                extras["raio_km"] = _inteiro(v)
             else:
                 return None, f"Opção desconhecida: <code>{esc(k)}=</code> — veja /help"
         except (ValueError, KeyError):
@@ -241,7 +250,8 @@ def tratar_comando(texto: str) -> str:
             onde = ", ".join(b for b in extras.get("bairros") or [] if b.strip("_ ")) or extras.get("cidade") or dados.get("estado", "")
             dados["nome"] = " ".join(x for x in (
                 extras.get("negocio") or "aluguel", extras.get("imovel") or "",
-                f"{extras['quartos_min']}q+" if extras.get("quartos_min") else "",
+                f"{extras['quartos_min']}-{extras['quartos_max']}q" if extras.get("quartos_max")
+                else f"{extras['quartos_min']}q+" if extras.get("quartos_min") else "",
                 dados["termo"], onde.replace("_", " ")) if x)[:100]
         elif not dados["termo"] and dados["tipo"] != "carro":
             return _AJUDA_ADD
@@ -267,6 +277,10 @@ def tratar_comando(texto: str) -> str:
         ex = salvo.get("filtros_extra") or {}
         if ex.get("cidade"):
             det.append(f"🏙 {esc(ex['cidade'])}" + (f" ({esc(', '.join(ex['bairros']))})" if ex.get("bairros") else ""))
+        if ex.get("raio_km"):
+            det.append(f"📏 raio de {ex['raio_km']} km")
+        if ex.get("quartos_max"):
+            det.append(f"até {ex['quartos_max']} quarto(s)")
         for k, rot in (("quartos_min", "quarto(s)+"), ("vagas_min", "vaga(s)+"), ("area_min", "m²+")):
             if ex.get(k):
                 det.append(f"{ex[k]} {rot}")

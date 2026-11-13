@@ -100,13 +100,6 @@ async def main():
         desc = s.extrair_descricao((await s._baixar(sessao, ads[0]["url"])).text)
         assert len(desc) > 10, "descrição do imóvel vazia"
 
-    bid = database.criar_busca({"nome": "canário aluguel", "tipo": "imovel", "termo": "", "estado": "sp",
-                                "filtros_extra": {"cidade": "São Paulo", "imovel": "apartamento", "quartos_min": 2}})
-    await s._atualizar_mercado(database.obter_busca(bid))
-    m = database.obter_busca(bid)["mercado"]
-    assert m.get("amostras") and m["n"] >= 100 and 1500 < m["mediana"] < 20000, f"mercado de aluguel: {str(m)[:200]}"
-    print(f"OK mercado de aluguel: {m['n']} imóveis em {len(m['amostras'])} grupos, custo mediano R$ {m['mediana']}")
-
     # mediana do mercado: a busca SEM o teto, como o bot mede 1x/dia
     bid = database.criar_busca({"nome": "canário mercado", "termo": "rtx 3090", "preco_max": 6000})
     await s._atualizar_mercado(database.obter_busca(bid))

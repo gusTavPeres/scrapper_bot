@@ -469,7 +469,8 @@ function preencherForm(b) {
 }
 
 // filtros_extra da busca de imóvel (os de carro só existem no Telegram: o painel não mexe neles)
-const CAMPOS_IMOVEL = ["negocio", "imovel", "cidade", "bairros", "quartos_min", "vagas_min", "area_min"];
+const CAMPOS_IMOVEL = ["negocio", "imovel", "cidade", "bairros", "quartos_min", "quartos_max", "vagas_min",
+                       "area_min", "centro", "raio_km"];
 
 function mostrarCamposDoTipo() {
   document.getElementById("grupo-imovel").hidden = document.getElementById("f-tipo").value !== "imovel";

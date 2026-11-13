@@ -160,7 +160,17 @@ class _Validacoes(BaseModel):
                 del v["bairros"]
         # número vindo como texto ("2011") era gravado como texto e todo scan
         # quebrava comparando int com str: a busca ficava em erro p/ sempre
-        for k, maximo in (("quartos_min", 5), ("vagas_min", 5), ("area_min", 10_000)):
+        if "centro" in v:               # "lat, lon" (painel/Telegram) ou [lat, lon]
+            c = v["centro"]
+            try:
+                c = [float(x) for x in (c.split(",") if isinstance(c, str) else c)]
+                if len(c) != 2 or not (-90 <= c[0] <= 90 and -180 <= c[1] <= 180):
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("centro deve ser 'latitude,longitude' (ex.: -23.55,-46.63)") from None
+            v["centro"] = c
+        for k, maximo in (("quartos_min", 5), ("quartos_max", 5), ("vagas_min", 5), ("area_min", 10_000),
+                          ("raio_km", 200)):
             if k in v:
                 try:
                     v[k] = int(v[k])
@@ -168,6 +178,8 @@ class _Validacoes(BaseModel):
                     raise ValueError(f"{k} deve ser um número inteiro") from None
                 if not 1 <= v[k] <= maximo:
                     raise ValueError(f"{k} fora de 1-{maximo}")
+        if v.get("quartos_min") and v.get("quartos_max") and v["quartos_min"] > v["quartos_max"]:
+            raise ValueError("quartos_min maior que quartos_max")
         for k in ("ano_min", "ano_max", "km_max"):
             if k in v:
                 try:
@@ -187,7 +199,8 @@ class _Validacoes(BaseModel):
 
 
 _EXTRAS_CARRO = {"ano_min", "ano_max", "km_max", "motor"}
-_EXTRAS_IMOVEL = {"negocio", "imovel", "cidade", "bairros", "quartos_min", "vagas_min", "area_min"}
+_EXTRAS_IMOVEL = {"negocio", "imovel", "cidade", "bairros", "quartos_min", "quartos_max", "vagas_min",
+                  "area_min", "centro", "raio_km"}
 
 
 def incoerencia(b: dict) -> str | None:
@@ -204,6 +217,8 @@ def incoerencia(b: dict) -> str | None:
             return "busca de imóvel exige o estado (ex.: estado=go)"
         if extras.get("bairros") and not extras.get("cidade"):
             return "bairros exigem a cidade"
+        if bool(extras.get("raio_km")) != bool(extras.get("centro")):
+            return "o raio exige o ponto de referência (perto=latitude,longitude) e vice-versa"
         return None
     if not b.get("termo") and tipo != "carro":
         return "termo obrigatório (só carro e imóvel aceitam busca sem termo)"

@@ -322,8 +322,9 @@ def _montar_url(busca: dict, pagina: int, teto: bool = True) -> str:
             # (bairro que a OLX não reconhece ela ignora: o filtro local garante)
             if len(bairros) == 1:
                 base += "/" + _slug(bairros[0])
-        if extras.get("quartos_min"):          # lista: "ros" repetido (5 = "5 ou mais")
-            params += "".join(f"&ros={n}" for n in range(min(extras["quartos_min"], 5), 6))
+        if extras.get("quartos_min") or extras.get("quartos_max"):   # lista: "ros" repetido (5 = "5 ou mais")
+            params += "".join(f"&ros={n}" for n in range(min(extras.get("quartos_min") or 1, 5),
+                                                         min(extras.get("quartos_max") or 5, 5) + 1))
         if extras.get("vagas_min"):
             params += "".join(f"&gsp={n}" for n in range(min(extras["vagas_min"], 5), 6))
         if extras.get("area_min"):
@@ -420,6 +421,96 @@ def _passa_filtros_carro(busca: dict, p: dict) -> bool:
     return True
 
 
+# ── RAIO (imóvel) ─────────────────────────────────────────
+
+GEOCODER = "https://nominatim.openstreetmap.org/search"
+
+
+def _geocodificar_sinc(consulta: str):
+    import requests
+    r = requests.get(GEOCODER, params={"q": consulta, "format": "json", "limit": 1, "countrycodes": "br"},
+                     headers={"User-Agent": "monitor-olx/1.0"}, timeout=15)
+    r.raise_for_status()
+    achados = r.json()
+    return (float(achados[0]["lat"]), float(achados[0]["lon"])) if achados else (None, None)
+
+
+GEOCODER_CEP = "https://cep.awesomeapi.com.br/json/"
+
+
+class _LimiteCep(Exception):
+    pass
+
+
+def _extrair_cep(pagina_html: str) -> str:
+    m = re.search(r'"(?:postalCode|zipcode)"\s*:\s*"(\d{5})-?(\d{3})"', pagina_html)
+    return m.group(1) + m.group(2) if m else ""
+
+
+_cep_pausa_ate = 0.0        # o serviço gratuito limita as consultas (429): espera 1 h
+
+
+def _geocodificar_cep_sinc(cep: str):
+    import requests
+    r = requests.get(GEOCODER_CEP + cep, headers={"User-Agent": "monitor-olx/1.0"}, timeout=15)
+    if r.status_code in (400, 404):
+        return None, None
+    if r.status_code == 429:
+        raise _LimiteCep()
+    r.raise_for_status()
+    d = r.json()
+    return (float(d["lat"]), float(d["lng"])) if d.get("lat") and d.get("lng") else (None, None)
+
+
+async def _geocodificar_cep(busca: dict, cep: str):
+    """Busca com raio: coordenadas do CEP do anúncio (1x por CEP). A mais de 100 km
+    do ponto de referência é erro da base: vale como não achado e fica o bairro.
+    Falha de rede não grava nada."""
+    global _cep_pausa_ate
+    centro = avaliador._extras(busca).get("centro")
+    if busca.get("tipo") != "imovel" or not centro or not cep or db.coords_local(f"cep:{cep}") is not None \
+            or time.monotonic() < _cep_pausa_ate:
+        return
+    try:
+        lat, lon = await asyncio.to_thread(_geocodificar_cep_sinc, cep)
+    except _LimiteCep:
+        _cep_pausa_ate = time.monotonic() + 3600
+        logger.info("serviço de CEP no limite de consultas: 1 h só com o centro do bairro")
+        return
+    except Exception as e:
+        logger.warning(f"geocodificação do CEP falhou: {e!r}")
+        return
+    db.salvar_coords(f"cep:{cep}", lat, lon)
+    if lat is not None and (avaliador.distancia_km(busca, {"cep": cep}) or 0) > 100:
+        db.salvar_coords(f"cep:{cep}", None, None)
+
+
+async def _geocodificar(busca: dict, ads: list[dict]):
+    """Busca com raio: acha (1x, guardado p/ sempre) o centro de cada bairro novo
+    no OpenStreetMap — 1 consulta por segundo, como o serviço pede. Resultado a
+    mais de 100 km do ponto de referência é homônimo de outra cidade: conta como
+    não achado. Falha de rede não grava nada (tenta na próxima rodada) e o
+    anúncio passa sem a distância."""
+    extras = avaliador._extras(busca)
+    if busca.get("tipo") != "imovel" or not extras.get("centro"):
+        return
+    uf = busca.get("estado") or ""
+    for chave in dict.fromkeys(avaliador.chave_local(uf, a) for a in ads):
+        if not chave or db.coords_local(chave) is not None:
+            continue
+        _, cidade, bairro = chave.split("|")
+        try:
+            lat, lon = await asyncio.to_thread(_geocodificar_sinc, f"{bairro}, {cidade}, {uf}, Brasil")
+        except Exception as e:
+            logger.warning(f"geocodificação de '{bairro}' falhou: {e!r}")
+            return
+        db.salvar_coords(chave, lat, lon)
+        d = avaliador.distancia_km(busca, {"local": f"{cidade}, {bairro}"}) if lat is not None else None
+        if d is not None and d > 100:
+            db.salvar_coords(chave, None, None)
+        await asyncio.sleep(1.1)
+
+
 # ── RASPAGEM ──────────────────────────────────────────────
 
 def _ja_lido(ads: list[dict], busca: dict) -> bool:
@@ -448,7 +539,8 @@ async def raspar_busca(busca: dict, fase: str) -> list[dict]:
             logger.info(f"  [{busca['nome']}] pág {pagina}: {url}")
             ads = None
             for _ in range(2):                    # resposta truncada ocasional: 1 retry
-                ads = await _pagina_de_busca(sessao, url, exige=exige)
+                # só na 1ª página: basta p/ saber se a cidade existe
+                ads = await _pagina_de_busca(sessao, url, exige=exige if pagina == 1 else "")
                 if ads is not None:
                     break
                 await asyncio.sleep(3)
@@ -459,6 +551,7 @@ async def raspar_busca(busca: dict, fase: str) -> list[dict]:
                 break
             vistos.update(a["list_id"] or a["url"] for a in novos)
             todos.extend(novos)
+            await _geocodificar(busca, novos)
             # alcançou o que já tinha visto (descartado pelos filtros locais nunca é
             # gravado: se contasse como "novo", o monitor nunca pararia cedo)
             relevantes = filtrar_produtos(busca, novos)
@@ -475,21 +568,32 @@ async def _preencher_descricoes(busca: dict, limite: int = 60):
     """Baixa a descrição dos anúncios ativos que ainda não têm (os critérios
     costumam viver nela)."""
     pendentes = db.anuncios_sem_descricao(busca["id"], limite)
-    if not pendentes:
+    if not pendentes and not (avaliador._extras(busca).get("centro") and db.ceps_sem_coords(busca["id"], 1)):
         return
     ok = 0
     async with _sessao() as sessao:
         for a in pendentes:
             try:
-                desc = extrair_descricao((await _baixar(sessao, a["url"])).text)
+                pagina = (await _baixar(sessao, a["url"])).text
+                desc, cep = extrair_descricao(pagina), _extrair_cep(pagina)
+                await _geocodificar_cep(busca, cep)
                 # '(sem descrição)' marca visita feita — evita refetch eterno
-                db.atualizar_descricao(a["id"], busca["id"], desc or "(sem descrição)")
+                db.atualizar_descricao(a["id"], busca["id"], desc or "(sem descrição)", cep)
                 ok += 1
             except OlxIndisponivel:
                 raise
             except Exception as e:                # tenta de novo no próximo ciclo
                 logger.debug(f"descrição {a['url'][:60]}: {e}")
             await asyncio.sleep(1.0)              # pausa também após falha (sem rajada)
+    # CEPs lidos enquanto o serviço estava no limite: localiza agora e reavalia
+    # (em silêncio) os anúncios deles — o que estiver fora do raio sai
+    for cep in db.ceps_sem_coords(busca["id"]) if avaliador._extras(busca).get("centro") else []:
+        if time.monotonic() < _cep_pausa_ate:
+            break
+        await _geocodificar_cep(busca, cep)
+        if db.coords_local(f"cep:{cep}") is not None:
+            db.reavaliar_cep(busca["id"], cep)
+        await asyncio.sleep(1.0)
     if ok:
         logger.info(f"[{busca.get('nome')}] {ok} descrições preenchidas")
 
@@ -530,37 +634,25 @@ async def _atualizar_mercado(busca: dict):
 
 
 async def _atualizar_mercado_imovel(busca: dict):
-    """Medianas do custo total por bairro e nº de quartos: a cidade (6 páginas das
-    mais novas, sem o teto) e cada bairro pedido (3 páginas, até 3 bairros) —
-    no máximo 15 requisições por dia."""
-    nome, extras = busca.get("nome"), avaliador._extras(busca)
-    # sem a lista de bairros: a referência da cidade precisa de todos eles
-    ampla = {**busca, "filtros_extra": {k: v for k, v in extras.items() if k != "bairros"}}
-    escopos = [(ampla, 6)] + [({**busca, "filtros_extra": {**extras, "bairros": [b]}}, 3)
-                              for b in (extras.get("bairros") or [])[:3]]
-    try:
-        amostra, vistos = [], set()
-        async with _sessao() as sessao:
-            for b, pags in escopos:
-                for pagina in range(1, pags + 1):
-                    ads = await _pagina_de_busca(sessao, _montar_url(b, pagina, teto=False))
-                    novos = [a for a in ads or [] if (a["list_id"] or a["url"]) not in vistos]
-                    if not novos:
-                        break
-                    vistos.update(a["list_id"] or a["url"] for a in novos)
-                    amostra += [a for a in novos if avaliador.triagem(ampla, a)[0]]
-                    await asyncio.sleep(1.5)
-        if _editada(busca, db._MUDA_MERCADO):
-            return
-        resumo = avaliador.resumo_mercado_imovel(amostra)
-        db.salvar_mercado(busca["id"], resumo or {"n": len(amostra)})
-        logger.info(f"[{nome}] mercado: " + (
-            f"{resumo['n']} imóveis em {len(resumo['amostras'])} grupos (bairro/quartos), "
-            f"custo mediano {avaliador._brl(resumo['mediana'])}"
-            if resumo else f"amostra pequena ({len(amostra)} imóveis), sem referência"))
-    except Exception as e:
-        logger.warning(f"[{nome}] medição de mercado falhou: {e}")
-        _bloqueio(e)
+    """Referência de preço do imóvel: os PRÓPRIOS anúncios da busca (30 dias), por
+    bairro, quartos e tamanho — sem requisição nenhuma. O mercado geral da cidade
+    foi testado e não serve: quem procura até R$ 2.000 está nos 20% mais baratos
+    dele, então tudo saía "abaixo do mercado" e kitnet real de R$ 600 saía como
+    golpe. O que interessa é qual é barato ENTRE os que cabem no filtro."""
+    amostra = [c for c in db.anuncios_comparaveis(busca["id"]) if avaliador.triagem(busca, c)[0]]
+    if (teto := busca.get("preco_max") or 0):
+        # só o que cabe (ou quase) no teto: o coletado vai até +15% no ALUGUEL, e com
+        # condomínio passa muito do teto — puxava a mediana e metade virava "barato"
+        amostra = [c for c in amostra
+                   if avaliador.custo_imovel(c)[0] <= teto * (1 + avaliador.MARGEM_NEGOCIACAO)]
+    if _editada(busca, db._MUDA_MERCADO):
+        return
+    resumo = avaliador.resumo_mercado_imovel(amostra)
+    db.salvar_mercado(busca["id"], resumo or {"n": len(amostra)})
+    logger.info(f"[{busca.get('nome')}] referência de preço: " + (
+        f"{resumo['n']} imóveis do filtro em {len(resumo['amostras'])} grupos (bairro/quartos), "
+        f"custo mediano {avaliador._brl(resumo['mediana'])}"
+        if resumo else f"amostra pequena ({len(amostra)} imóveis), sem referência"))
 
 
 # ── LOOP PRINCIPAL ────────────────────────────────────────

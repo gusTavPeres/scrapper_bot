@@ -2984,7 +2984,7 @@ def test_p13_vendedor_em_serie_entre_rodadas():
 
 
 def _imovel_olx(lid, titulo, aluguel, local="Cidade Alfa, Bairro Um", cat="Apartamentos", negocio="Aluguel",
-                data=1792716949, **props):
+                data=None, **props):
     """Anúncio de imóvel como a OLX manda (properties com os rótulos reais)."""
     rot = {"condominio": "Condomínio", "iptu": "IPTU", "size": "Área útil", "rooms": "Quartos",
            "bathrooms": "Banheiros", "garage_spaces": "Vagas na garagem"}
@@ -2992,7 +2992,8 @@ def _imovel_olx(lid, titulo, aluguel, local="Cidade Alfa, Bairro Um", cat="Apart
     if negocio:
         ps.append({"name": "real_estate_type", "label": "Tipo", "value": f"{negocio} - apartamento padrão"})
     ps += [{"name": k, "label": rot[k], "value": str(v)} for k, v in props.items()]
-    return anuncio_olx(lid, titulo, aluguel, location=local, category=cat, properties=ps, date=data)
+    return anuncio_olx(lid, titulo, aluguel, location=local, category=cat, properties=ps,
+                       date=data or int(time.time()))             # postado agora: não é estoque do 1º scan
 
 
 def _ap(**kw):
@@ -3195,19 +3196,19 @@ def test_p13_aluguel_ponta_a_ponta():
              _imovel_olx(9003, "Apartamento em outro bairro", 1800, local="Cidade Alfa, Bairro Nove", rooms="2",
                          garage_spaces="1"),
              _imovel_olx(9004, "Apartamento por temporada", 1800, rooms="2", garage_spaces="1")]
-    olx = OlxFalsa({"pe=": (200, pagina(busca)), "anuncio-": (200, pagina_anuncio(desc)),
-                    "o=1&sf=1": (200, pagina(mercado))})
+    # a referência de preço são os próprios anúncios do filtro: nenhuma requisição a mais
+    olx = OlxFalsa({"o=1&sf=1&pe=3450": (200, pagina(busca + mercado)), "anuncio-": (200, pagina_anuncio(desc))})
     scheduler._sessao = olx
     textos = []
     notifier._post = lambda metodo, dados, timeout: bool(textos.append(dados.get("caption") or dados.get("text"))) or True
     rodar(scheduler.processar_busca(db.obter_busca(b["id"])))
     urls = olx.paginas()
     assert any("/imoveis/aluguel/apartamentos/estado-go/cidade-alfa?o=1&sf=1&pe=3450&ros=2" in u for u in urls), urls
-    assert any("/cidade-alfa/bairro-um?o=1" in u and "pe=" not in u for u in urls), urls       # mercado do bairro
+    assert all("pe=3450" in u or "anuncio-" in u for u in urls), urls
     assert all(p.startswith("RSC ") and p.endswith("&_rsc") for p in olx.pedidos if "anuncio-" not in p), olx.pedidos
-    assert sql("SELECT COUNT(*) FROM anuncios")[0][0] == 3                    # o de outro bairro nem é gravado
+    assert sql("SELECT COUNT(*) FROM anuncios")[0][0] == 13, sql("SELECT titulo FROM anuncios")   # o de outro bairro nem é gravado
     m = db.obter_busca(b["id"])["mercado"]
-    assert m["n"] == 10 and len(m["amostras"]["cidade alfa|bairro um|2"]) == 10, m
+    assert m["n"] == 12 and len(m["amostras"]["cidade alfa|bairro um|2"]) == 12, m      # o de temporada fica fora
     rodar(avaliador.processar_fila(notifier))
     an = {r[0]: r[1:] for r in sql("SELECT a.titulo, an.decisao, an.alerta, an.avaliacao_preco FROM analises an "
                                    "JOIN anuncios a ON a.id = an.anuncio_id")}
@@ -3215,16 +3216,16 @@ def test_p13_aluguel_ponta_a_ponta():
     assert an["Apartamento 2 quartos reformado"] == ("APROVADO", "novo", "justo"), an
     assert an["Apartamento por temporada"][0] == "EXCLUIDO", an
     alertas = [t for t in textos if "Ver anúncio" in t]
-    assert len(alertas) == 2, textos
+    assert len(alertas) == avaliador.MAX_ALERTAS, textos                     # o melhor primeiro; o resto no /top
     assert "ABAIXO DO MERCADO" in alertas[0] and "R$ 2.350/mês (aluguel R$ 1.750 + cond. R$ 500 + IPTU R$ 100)" in alertas[0]
     assert "vs mediana do bairro" in alertas[0] and "📦" not in alertas[0] and "direto com o proprietário" in alertas[0]
-    assert "NOVO NO SEU FILTRO" in alertas[1], alertas[1]
+    assert sum("NOVO NO SEU FILTRO" in t for t in alertas) == 2, alertas     # 3 baratos + 2 a preço normal
     # rodada seguinte: nada novo, nenhum alerta repetido; o mercado não é remedido no mesmo dia
     n = len(olx.pedidos)
     sql("UPDATE buscas SET proximo_scan=datetime('now','-1 minute')")
     rodar(scheduler.processar_busca(db.obter_busca(b["id"])))
     rodar(avaliador.processar_fila(notifier))
-    assert len([t for t in textos if "Ver anúncio" in t]) == 2 and all("pe=" in u for u in olx.pedidos[n:]), olx.pedidos[n:]
+    assert len([t for t in textos if "Ver anúncio" in t]) == avaliador.MAX_ALERTAS and all("pe=3450" in u for u in olx.pedidos[n:]), olx.pedidos[n:]
     # cidade que a OLX não reconhece (ela ignora e devolveria o estado inteiro): erro claro, na hora
     avisos = []
     notifier.alertar = lambda chave, texto, horas=12: avisos.append((chave, texto)) or True
@@ -3232,7 +3233,7 @@ def test_p13_aluguel_ponta_a_ponta():
     sql("UPDATE buscas SET fase='scan'")
     rodar(scheduler.processar_busca(db.obter_busca(b["id"])))
     assert avisos and avisos[0][0] == f"local:{b['id']}" and "não reconheceu a cidade “cidade alfa”" in avisos[0][1], avisos
-    assert sql("SELECT COUNT(*) FROM anuncios")[0][0] == 3
+    assert sql("SELECT COUNT(*) FROM anuncios")[0][0] == 13
     # ...ou responde 5xx: busca que nunca leu nada avisa na hora; a que já leu espera as 6 h
     nova = db.criar_busca({"nome": "nova", "tipo": "imovel", "termo": "", "estado": "go",
                            "filtros_extra": {"cidade": "Errada"}})
@@ -3312,7 +3313,7 @@ def test_p13_revisao_independente():
     def item(descricao=desc, **kw):
         extra = {k: kw.pop(k) for k in ("instrucoes",) if k in kw}
         return {**_BUSCA_AP, "anuncio_id": 1, "busca_id": 1, "nome": "aluguel", "instrucoes": "",
-                "criterios_inclusao": [], "criterios_exclusao": [], **_ap(aluguel=2250, **kw),
+                "criterios_inclusao": [], "criterios_exclusao": [], **_ap(**{"aluguel": 2250, **kw}),
                 "descricao": descricao, "mercado": _mercado_ap(), **extra}
     # frases inocentes não são golpe; as do golpe continuam sendo
     for frase in ("Favor agendar por mensagem antes da visita.", "Pintura nova no exterior do prédio.",
@@ -3332,6 +3333,15 @@ def test_p13_revisao_independente():
               "Quero alugar casa 2 quartos", "Estou à procura de kitnet", "Vaga em república masculina",
               "Divido apartamento com estudante", "Apartamento por temporada", "Galpão ou sala comercial"):
         assert not tri(t)[0], t
+    # quarto avulso não é apartamento de 1 quarto; "2 quartos e suíte" é
+    for t in ("Aluguel de quartos mobiliados", "Alugo quarto perto da universidade", "Aluga-se suíte individual",
+              "Aluguel para 1 pessoa, com água inclusa", "Quarto individual com banheiro"):
+        assert not tri(t)[0], t
+    assert tri("Alugo quarto", imovel="quarto") != (False, "quarto/vaga compartilhada")
+    for t in ("Aluga-se apartamento 2 quartos mobiliado", "Aluguel de apartamento com 1 quarto e suíte", "Alugo kitnet"):
+        assert tri(t)[0], t
+    # kitnet barata num bairro de flats não é golpe: só bem abaixo do PISO dos comparáveis
+    assert avaliar(item(aluguel=1550), [])["alerta"] == "comprar"          # total 2.150: -25%, acima do piso
     # "dispensa fiador" atende a regra "sem fiador"
     av = avaliar(item(desc + " Dispensa fiador.", instrucoes="sem fiador"), [])
     assert av["decisao"] == "APROVADO" and "sem fiador" in av["pros"], av
@@ -3389,6 +3399,15 @@ def test_p13_republicacao_e_queda_de_imovel():
     a3 = grava(3, "Apartamento 3 quartos Bairro Um", modelo + "Unidade C.", rooms="3", size="90m²")
     rodar(avaliador.processar_fila(n))
     assert sorted(n.enviados) == [a1, a2, a3], n.enviados
+    # estoque: anunciado dias antes de a busca existir não alerta (fica no /top)
+    sql("UPDATE buscas SET criado_em=datetime('now')")
+    velho = scheduler._mapear_flight_ad(_imovel_olx(7, "Casa 2 quartos Bairro Seis", 1500, cat="Casas", rooms="2",
+                                                    data=int(time.time()) - 5 * 86400))
+    aid, _, _ = db.upsert_anuncio(b["id"], velho)
+    db.atualizar_descricao(aid, b["id"], "Casa com quintal, dois quartos e garagem para dois carros, rua tranquila.")
+    rodar(avaliador.processar_fila(n))
+    assert len(n.enviados) == 3 and sql("SELECT alerta FROM analises WHERE anuncio_id=?", aid)[0][0] == "novo"
+    sql("UPDATE buscas SET criado_em=datetime('now','-3 days')")
     grava(4, "Apartamento 2 quartos Bairro Um!", modelo + "Unidade A.")        # o mesmo imóvel, repostado
     rodar(avaliador.processar_fila(n))
     assert len(n.enviados) == 3, n.enviados
@@ -3420,6 +3439,107 @@ def test_p13_republicacao_e_queda_de_imovel():
     scheduler._sessao = OlxFalsa({"pe=": (200, pag({**caro, "priceValue": "R$ 2.950"})), "o=1": (200, pagina_olx([]))})
     rodar(scheduler.processar_busca(db.obter_busca(b["id"])))
     assert quedas == [], quedas
+
+
+def test_p13_aluguel_raio_e_quartos_max():
+    """Raio a partir de um ponto: o centro de cada bairro é geocodificado 1x e
+    guardado; fora do raio não entra; bairro que o mapa não conhece passa com aviso.
+    quartos=1-1 = só 1 quarto."""
+    novo_banco()
+    r = tb.tratar_comando("/addaluguel estado=go cidade=cidade_alfa quartos=1-1 perto=-10.0,-50.0 raio=8 max=1500")
+    assert "criada" in r and "raio de 8 km" in r and "até 1 quarto(s)" in r, r
+    b = db.listar_buscas()[0]
+    assert b["nome"] == "aluguel 1-1q cidade alfa" and b["filtros_extra"]["centro"] == [-10.0, -50.0], b
+    u = scheduler._montar_url(b, 1)
+    assert u.endswith("&pe=1725&ros=1") and "ros=2" not in u, u
+    assert scheduler._montar_url({**b, "filtros_extra": {"quartos_max": 3, "quartos_min": 2}}, 1).endswith("&ros=2&ros=3")
+    for ruim, erro in (("perto=abc raio=8", "latitude,longitude"), ("perto=-10,-50", "raio exige"), ("raio=8", "raio exige"),
+                       ("quartos=3-2", "quartos_min maior"), ("perto=-100,-50 raio=8", "latitude,longitude")):
+        assert erro in tb.tratar_comando(f"/addaluguel estado=go cidade=cidade_alfa {ruim}"), (ruim, erro)
+    # ~0,009 grau de latitude = 1 km
+    mapa = {"perto": (-10.02, -50.0), "longe": (-10.2, -50.0), "homonimo": (-25.0, -50.0), "sumido": (None, None)}
+    consultas = []
+    def geo(consulta):
+        consultas.append(consulta)
+        return mapa[consulta.split(",")[0]]
+    orig = scheduler._geocodificar_sinc
+    scheduler._geocodificar_sinc = geo
+    try:
+        ads = [_ap(lid=i, local=f"Cidade Alfa, {nome.capitalize()}", rooms="1", aluguel=900)
+               for i, nome in enumerate(("perto", "longe", "homonimo", "sumido", "perto"))] + \
+              [_ap(lid=9, local="Cidade Alfa", rooms="1", aluguel=900), _ap(lid=10, local="Cidade Alfa, Perto", rooms="2")]
+        rodar(scheduler._geocodificar(b, ads))
+        assert consultas == [f"{n}, cidade alfa, go, Brasil" for n in ("perto", "longe", "homonimo", "sumido")], consultas
+        rodar(scheduler._geocodificar(b, ads))
+        assert len(consultas) == 4                                   # guardado: não consulta de novo
+        ficou = [a["list_id"] for a in scheduler.filtrar_produtos(b, ads)]
+        assert ficou == [0, 2, 3, 4, 9], ficou                       # longe sai; 2 quartos sai; desconhecidos passam
+        assert "raio de 8 km" in avaliador.passa_filtros_imovel(b, ads[1])[1]
+        item = lambda a: {**b, "anuncio_id": 1, "busca_id": b["id"], "instrucoes": "", "criterios_inclusao": [],
+                          "criterios_exclusao": [], **a, "descricao": "Kitnet reformada, com armários e uma vaga de garagem coberta, perto de tudo."}
+        assert "a ~2,2 km do seu ponto de referência" in avaliar(item(ads[0]), [])["pros"]
+        # o CEP da página do anúncio dá a rua: vale mais que o centro do bairro
+        ceps, mapa_cep = [], {"74000001": (-10.2, -50.0), "74000002": (-10.01, -50.0), "74000003": (-25.0, -50.0)}
+        def geo_cep(cep):
+            ceps.append(cep)
+            return mapa_cep.get(cep, (None, None))
+        orig_cep, scheduler._geocodificar_cep_sinc = scheduler._geocodificar_cep_sinc, geo_cep
+        try:
+            assert scheduler._extrair_cep('{"postalCode":"74000-001"}') == scheduler._extrair_cep('"zipcode": "74000001",') == "74000001"
+            assert scheduler._extrair_cep("<html>sem cep</html>") == ""
+            for cep in ("74000001", "74000001", "74000002", "74000003", "74000004", ""):
+                rodar(scheduler._geocodificar_cep(b, cep))
+            assert ceps == ["74000001", "74000002", "74000003", "74000004"], ceps          # 1 consulta por CEP
+            longe_pelo_cep = {**ads[0], "cep": "74000001"}                # bairro "perto", rua a 22 km
+            assert "raio de 8 km" in avaliador.passa_filtros_imovel(b, longe_pelo_cep)[1]
+            assert avaliar(item(longe_pelo_cep), [])["decisao"] == "EXCLUIDO"
+            assert "a ~1,1 km do seu ponto de referência" in avaliar(item({**ads[3], "cep": "74000002"}), [])["pros"]
+            for cep in ("74000003", "74000004"):                          # base errada / CEP desconhecido: vale o bairro
+                assert "a ~2,2 km do seu ponto de referência" in avaliar(item({**ads[0], "cep": cep}), [])["pros"]
+            # a página do anúncio grava descrição E CEP
+            aid, _, _ = db.upsert_anuncio(b["id"], ads[0])
+            pag = pagina_anuncio("Kitnet reformada perto de tudo, com armários.").replace("</html>", '<script>{"postalCode":"74000002"}</script></html>')
+            scheduler._sessao = OlxFalsa({"anuncio-": (200, pag)})
+            rodar(scheduler._preencher_descricoes(b))
+            assert sql("SELECT cep, descricao FROM anuncios WHERE id=?", aid)[0][:1] == ("74000002",)
+            assert db.obter_fila_pendente()[0]["cep"] == "74000002"
+            # CEP lido com o serviço no limite: localizado numa rodada seguinte, e o anúncio reavaliado
+            rodar(avaliador.processar_fila(None))
+            sql("UPDATE anuncios SET cep='74000009' WHERE id=?", aid)
+            mapa_cep["74000009"] = (-10.3, -50.0)
+            assert db.ceps_sem_coords(b["id"]) == ["74000009"]
+            rodar(scheduler._preencher_descricoes(b))
+            assert db.ceps_sem_coords(b["id"]) == [] and sql("SELECT prioridade FROM fila WHERE anuncio_id=?", aid)[0][0] == -1
+            rodar(avaliador.processar_fila(None))
+            assert "raio de 8 km" in sql("SELECT motivo FROM analises WHERE anuncio_id=?", aid)[0][0]
+        finally:
+            scheduler._geocodificar_cep_sinc = orig_cep
+        assert any("medir a distância" in o for o in avaliar(item(ads[3]), [])["observacoes"])
+        # mapa fora do ar: nada é gravado, o anúncio passa e a rodada segue
+        def fora(consulta):
+            raise OSError("sem rede")
+        scheduler._geocodificar_sinc = fora
+        novo = _ap(lid=20, local="Cidade Alfa, Outro", rooms="1", aluguel=900)
+        rodar(scheduler._geocodificar(b, [novo]))
+        assert db.coords_local("go|cidade alfa|outro") is None and scheduler.filtrar_produtos(b, [novo])
+        _erros_de_log.clear()
+    finally:
+        scheduler._geocodificar_sinc = orig
+
+
+def test_p13_coluna_nova_em_banco_ja_migrado():
+    """O banco de produção (user_version já em dia) não passa pela migração antiga:
+    coluna nova tem de ser criada no init_db. Sem isso o laço inteiro parou."""
+    caminho = novo_banco()
+    with db.get_conn() as c:
+        versao = c.execute("PRAGMA user_version").fetchone()[0]
+        c.execute("ALTER TABLE anuncios DROP COLUMN cep")
+    assert versao >= 1
+    db.init_db()
+    bid = criar()
+    aid, _, _ = db.upsert_anuncio(bid, {"url": "https://x/a-1", "titulo": "RTX 3090", "preco": 4000})
+    db.atualizar_descricao(aid, bid, "texto", "74000001")
+    assert db.obter_fila_pendente()[0]["cep"] == "74000001"
 
 
 if __name__ == "__main__":

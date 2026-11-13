@@ -775,7 +775,8 @@ _RE_TEMPORADA = re.compile(r"\b(temporada|diarias?|por noite|airbnb|reveillon)\b
 _RE_COMERCIAL = re.compile(r"\b(sala comercial|ponto comercial|imovel comercial|galpao|consultorio)\b")
 _RE_DIVIDIR = re.compile(r"\b(divido|dividir (?:ap|apto|apartamento|casa|aluguel|quarto)|vaga em republica|"
                          r"quarto em republica|republica (?:feminina|masculina|estudantil|de estudantes)|"
-                         r"quarto compartilhado|pensionato|pensao)\b")
+                         r"quarto compartilhado|pensionato|pensao|quarto individual|para (?:1|uma) pessoa|"
+                         r"alug\w*(?:-se)? (?:de |um |uma )?(?:quartos?|suites?)(?! e\b))\b")
 _CATEGORIA_IMOVEL = {"apartamento": ("apartamentos",), "casa": ("casas",),
                      "quarto": ("aluguel de quartos",), "qualquer": ("apartamentos", "casas")}
 POSITIVOS_IMOVEL = [
@@ -884,6 +885,31 @@ def custo_imovel(d: dict, texto: str = "") -> tuple[float, str, list[str]]:
     return aluguel + cond + iptu, " + ".join(partes), avisos
 
 
+def chave_local(estado: str, a: dict) -> str:
+    """'go|cidade|bairro' do anúncio ('' sem bairro): chave do cache de coordenadas."""
+    im = dados_imovel(a)
+    return f"{norm(estado)}|{im['cidade']}|{im['bairro']}" if im["cidade"] and im["bairro"] else ""
+
+
+def distancia_km(busca: dict, a: dict):
+    """Do anúncio ao ponto de referência da busca: pelo CEP (precisão de rua) quando
+    a página do anúncio já foi lida, senão pelo centro do bairro (1-2 km de erro).
+    None = sem ponto de referência ou local que o mapa não conhece."""
+    import math
+    centro, chave = _extras(busca).get("centro"), chave_local(busca.get("estado") or "", a)
+    if not centro:
+        return None
+    # o CEP (da página do anúncio) dá a rua; sem ele, o centro do bairro
+    c = db.coords_local(f"cep:{a['cep']}") if a.get("cep") else None
+    if not c or c[0] is None:
+        c = db.coords_local(chave) if chave else None
+    if not c or c[0] is None:
+        return None
+    (la1, lo1), (la2, lo2) = centro, c
+    x = math.radians(lo2 - lo1) * math.cos(math.radians((la1 + la2) / 2))
+    return 6371 * math.hypot(x, math.radians(la2 - la1))
+
+
 def passa_filtros_imovel(busca: dict, a: dict) -> tuple[bool, str]:
     """Filtros determinísticos da busca de imóvel sobre a ficha da OLX: negócio,
     tipo, cidade, bairros, quartos, vagas, área. Quartos/vagas/área ausentes no
@@ -907,6 +933,11 @@ def passa_filtros_imovel(busca: dict, a: dict) -> tuple[bool, str]:
                                  ("area_min", "area", "m²")):
         if ex.get(chave) and im[campo] is not None and im[campo] < ex[chave]:
             return False, f"{im[campo]} {rotulo}: abaixo do mínimo de {ex[chave]}"
+    if ex.get("quartos_max") and im["quartos"] is not None and im["quartos"] > ex["quartos_max"]:
+        return False, f"{im['quartos']} quarto(s): acima do máximo de {ex['quartos_max']}"
+    # bairro que o mapa não conhece passa (a avaliação avisa): calar perderia anúncio
+    if ex.get("raio_km") and (d := distancia_km(busca, a)) is not None and d > ex["raio_km"]:
+        return False, f"a {d:.0f} km do ponto de referência (raio de {ex['raio_km']} km)"
     return True, ""
 
 
@@ -932,7 +963,7 @@ def triagem_imovel(busca: dict, a: dict) -> tuple[bool, str]:
 
 
 def resumo_mercado_imovel(anuncios: list[dict]) -> dict | None:
-    """Amostra do mercado: {'cidade|bairro|quartos': [[custo total, área], ...]}.
+    """Amostra de referência: {'cidade|bairro|quartos': [[custo total, área], ...]}.
     Guarda os pontos, não só a mediana: a referência de cada anúncio sai dos
     imóveis de TAMANHO parecido (ver referencia_imovel)."""
     amostras: dict[str, list] = {}
@@ -975,7 +1006,7 @@ def referencia_imovel(item: dict) -> dict | None:
         q1, med, q3 = statistics.quantiles(vs, n=4)
         if (q3 - q1) / med <= limite:
             return {"mediana": round(med), "q1": q1, "q3": q3, "n": len(vs), "escopo": escopo,
-                    "p10": statistics.quantiles(vs, n=10)[0] if len(vs) >= 10 else None,
+                    "p10": statistics.quantiles(vs, n=10)[0] if len(vs) >= 10 else None, "min": min(vs),
                     "tamanho": vs is parecidos}
     return None
 
@@ -1000,6 +1031,11 @@ def avaliar_imovel(item: dict, texto: str, regras: list, modelo, descartado: str
                                  ("area_min", "area", "a área")) if ex.get(ch) and im[c] is None]
     if faltam:
         obs.append(f"Não informa {', '.join(faltam)} — confirme antes de visitar")
+    if ex.get("centro"):
+        if (d := distancia_km(item, item)) is not None:
+            pros.append(f"a ~{d:.1f} km do seu ponto de referência".replace(".", ","))
+        elif ex.get("raio_km"):
+            obs.append("Não foi possível medir a distância deste bairro — confira no mapa")
 
     # "sem problemas de infiltração ou mofo": o 2º item da lista herda o "sem"
     probs = [r for ch, r in dict(PROBLEMAS_IMOVEL).items() if afirmado(texto, ch) and not re.search(
@@ -1046,8 +1082,9 @@ def avaliar_imovel(item: dict, texto: str, regras: list, modelo, descartado: str
     ref, n, escopo = r.get("mediana"), r.get("n", 0), r.get("escopo", "")
     pct = round((total - ref) / ref * 100) if ref and total else None
     avp, suspeita, onde = "sem_base", False, {"bairro": "do bairro", "cidade": "da cidade"}.get(escopo, "")
-    # cidade é referência aproximada (bairro barato fica 40% abaixo dela sem ser golpe)
-    lim_susp = -50 if escopo == "bairro" else -65
+    # barato demais = bem abaixo do PISO dos comparáveis (60% do 10º percentil), não
+    # um % da mediana: kitnet de 650 num bairro de flats de 2.600 é real, e saía ⚠️
+    piso = 0.6 * (r.get("p10") or r.get("min") or 0)
     if not total:
         obs.append("Preço a combinar")
     elif teto and total > teto:
@@ -1065,7 +1102,7 @@ def avaliar_imovel(item: dict, texto: str, regras: list, modelo, descartado: str
             score, avp = min(score - 2, 4), "caro"
             motivos.append(f"total {acima}% acima do seu teto de {_brl(teto)}")
     elif pct is not None:
-        if pct < lim_susp:
+        if total < piso and pct < -40:
             avp, suspeita = "suspeito", True        # avisa com ⚠️ (nota no máx. 7): pode ser real
             obs.append(f"{-pct}% abaixo da mediana {onde} ({_brl(ref)}): aluguel barato demais é o golpe "
                        "mais comum — nunca pague nada antes de visitar o imóvel")
@@ -1445,6 +1482,21 @@ def republicacao(item: dict) -> tuple[int | None, bool]:
     return next((c["id"] for c in mesmos if c["recente"]), None), False
 
 
+def _estoque(item: dict) -> bool:
+    """Imóvel já anunciado 2+ dias ANTES de a busca existir: é o estoque do 1º scan
+    (centenas cabem num filtro de aluguel). Não alerta — fica no /top e no painel;
+    as descrições chegam 60 por rodada e cada leva renderia mais 5 alertas, por
+    dias. Sem data, vale como novo."""
+    if item.get("tipo") != "imovel":
+        return False
+    try:
+        from datetime import timedelta, timezone
+        criada = datetime.fromisoformat(item["criado_em"]).replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(item["data_postagem"]) < criada - timedelta(days=2)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 ultimo_processamento: str | None = None
 # ponytail: teto fixo por busca e passada; o 1º scan de uma busca ampla (ou um
 # bug, como o fuzz que gravou 50 buscas-lixo e mandou 170 alertas) não vira
@@ -1496,7 +1548,7 @@ async def processar_fila(notifier=None):
                 # notificado: a reavaliação (preço mudou) não re-notifica. Descrição
                 # ainda não baixada: o alerta sai quando ela chegar (re-enfileira)
                 if av["alerta"] and notifier and item["ativo"] and not item["notificado"] \
-                        and item.get("descricao"):
+                        and item.get("descricao") and not _estoque(item):
                     alertas.append((item, av))
                 _broadcast({"tipo": "avaliado", "anuncio_id": item["anuncio_id"],
                             "busca_id": item["busca_id"], "recomendacao": av["recomendacao"],

@@ -124,6 +124,10 @@ def init_db():
         """)
         if "alerta" not in {r[1] for r in conn.execute("PRAGMA table_info(analises)")}:
             conn.execute("ALTER TABLE analises ADD COLUMN alerta TEXT DEFAULT ''")
+        # fora do _migrar_v1 (que só roda em banco antigo): o banco de produção já
+        # migrado ficou sem a coluna e o laço inteiro parou
+        if "cep" not in {r[1] for r in conn.execute("PRAGMA table_info(anuncios)")}:
+            conn.execute("ALTER TABLE anuncios ADD COLUMN cep TEXT DEFAULT ''")
         if "mercado" not in {r[1] for r in conn.execute("PRAGMA table_info(buscas)")}:
             conn.execute("ALTER TABLE buscas ADD COLUMN mercado TEXT DEFAULT ''")
         versao = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -143,6 +147,10 @@ def init_db():
         );
         -- 👍/👎 do usuário. Guarda CÓPIA do texto: o aprendizado sobrevive à
         -- remoção da busca/anúncio (anuncio_id vira NULL)
+        -- centro de cada bairro (geocodificado 1x); lat NULL = não encontrado
+        CREATE TABLE IF NOT EXISTS locais (
+            chave TEXT PRIMARY KEY, lat REAL, lon REAL
+        );
         CREATE TABLE IF NOT EXISTS feedback (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             anuncio_id      INTEGER UNIQUE REFERENCES anuncios(id) ON DELETE SET NULL,
@@ -517,7 +525,7 @@ def anuncios_sem_descricao(busca_id: int, limite: int = 30) -> list[dict]:
     buscar descrição de produto errado era 1 visita desperdiçada por anúncio."""
     with get_conn() as conn:
         rows = conn.execute("""
-            SELECT a.id, a.url FROM anuncios a
+            SELECT a.id, a.url, a.local FROM anuncios a
             LEFT JOIN analises an ON an.anuncio_id = a.id
             WHERE a.busca_id=? AND (a.descricao IS NULL OR a.descricao='')
               AND (an.recomendacao IS NULL OR an.recomendacao != 'IGNORAR')
@@ -527,10 +535,12 @@ def anuncios_sem_descricao(busca_id: int, limite: int = 30) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def atualizar_descricao(anuncio_id: int, busca_id: int, descricao: str):
-    """Grava a descrição e re-enfileira: a avaliação só-título é inferior."""
+def atualizar_descricao(anuncio_id: int, busca_id: int, descricao: str, cep: str = ""):
+    """Grava a descrição (e o CEP, que só a página do anúncio traz) e
+    re-enfileira: a avaliação só-título é inferior."""
     with get_conn() as conn:
-        conn.execute("UPDATE anuncios SET descricao=? WHERE id=?", (descricao, anuncio_id))
+        conn.execute("UPDATE anuncios SET descricao=?, cep=COALESCE(NULLIF(?, ''), cep) WHERE id=?",
+                     (descricao, cep, anuncio_id))
         conn.execute(_ENFILEIRA, (anuncio_id, busca_id, 1))
 
 
@@ -551,7 +561,8 @@ def obter_fila_pendente(limite: int = 5000) -> list[dict]:
         rows = conn.execute("""
             SELECT f.id as fila_id, f.anuncio_id, f.busca_id, f.tentativas, f.prioridade,
                    a.titulo, a.preco, a.local, a.envio, a.descricao, a.url,
-                   a.imagem, a.vendedor, a.atributos, a.categoria, a.notificado,
+                   a.imagem, a.vendedor, a.atributos, a.categoria, a.notificado, a.data_postagem, a.cep,
+                   b.criado_em,
                    (a.ultima_vez >= datetime('now','-2 days')) AS ativo,
                    (SELECT gostou FROM feedback fb WHERE fb.anuncio_id = a.id) AS feedback,
                    b.termo, b.tipo, b.criterios_inclusao, b.criterios_exclusao,
@@ -593,7 +604,7 @@ def anuncios_comparaveis(busca_id: int) -> list[dict]:
     notebooks e outros modelos: R$3.691 vs R$12.017 reais numa busca de 4090)."""
     with get_conn() as conn:
         rows = conn.execute("""
-            SELECT id, titulo, atributos, descricao, preco, categoria, local FROM anuncios
+            SELECT id, titulo, atributos, descricao, preco, categoria, local, cep FROM anuncios
             WHERE busca_id=? AND preco > 0 AND ultima_vez >= datetime('now','-30 days')
         """, (busca_id,)).fetchall()
         return [dict(r) for r in rows]
@@ -662,6 +673,34 @@ def alertados_parecidos(busca_id: int, anuncio_id: int, preco: float) -> list[di
             WHERE busca_id=? AND id!=? AND notificado=1
               AND preco BETWEEN ? AND ? AND primeira_vez >= datetime('now','-14 days')
         """, (busca_id, anuncio_id, preco * 0.9, preco * 1.03))]
+
+
+def coords_local(chave: str):
+    """(lat, lon) do bairro já geocodificado; (None, None) = não achado; None = nunca consultado."""
+    with get_conn() as conn:
+        r = conn.execute("SELECT lat, lon FROM locais WHERE chave=?", (chave,)).fetchone()
+        return tuple(r) if r else None
+
+
+def ceps_sem_coords(busca_id: int, limite: int = 40) -> list[str]:
+    """CEPs de anúncios ativos da busca ainda não localizados (os mais novos primeiro)."""
+    with get_conn() as conn:
+        return [r[0] for r in conn.execute("""
+            SELECT cep FROM anuncios WHERE busca_id=? AND cep != ''
+              AND ultima_vez >= datetime('now','-2 days')
+              AND 'cep:' || cep NOT IN (SELECT chave FROM locais)
+            GROUP BY cep ORDER BY MAX(primeira_vez) DESC LIMIT ?""", (busca_id, limite))]
+
+
+def reavaliar_cep(busca_id: int, cep: str):
+    with get_conn() as conn:
+        conn.execute("INSERT OR IGNORE INTO fila (anuncio_id, busca_id, prioridade) "
+                     "SELECT id, busca_id, -1 FROM anuncios WHERE busca_id=? AND cep=?", (busca_id, cep))
+
+
+def salvar_coords(chave: str, lat, lon):
+    with get_conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO locais (chave, lat, lon) VALUES (?, ?, ?)", (chave, lat, lon))
 
 
 def marcar_notificado(anuncio_id: int):

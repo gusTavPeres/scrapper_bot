@@ -35,9 +35,12 @@ navegador) e avisa no Telegram quando aparece uma oportunidade.
   bairro vão na URL da OLX; quartos, vagas, área e tipo (apartamento, casa,
   quarto) filtram pela ficha do anúncio. O teto vale para o **custo total do
   mês** (aluguel + condomínio + IPTU; IPTU anual digitado no campo mensal é
-  dividido por 12, "condomínio incluso" é lido da descrição). 1x/dia o bot mede
-  o mercado da cidade e dos bairros pedidos e compara cada anúncio com imóveis
-  do mesmo bairro, nº de quartos e tamanho parecido. Com teto, todo anúncio novo
+  dividido por 12, "condomínio incluso" é lido da descrição). Cada anúncio é
+  comparado com os outros que cabem no mesmo filtro: mesmo bairro, nº de quartos
+  e tamanho parecido. `perto=latitude,longitude raio=8` limita a um raio (pelo
+  CEP da página do anúncio; sem ele, pelo centro do bairro no OpenStreetMap).
+  O estoque do 1º scan não vira alerta (fica no `/top`): só o que for anunciado
+  depois. Com teto, todo anúncio novo
   que cabe nos filtros avisa: 🏠 NOVO NO SEU FILTRO, 🟢 ABAIXO DO MERCADO (entre
   os 25% mais baratos dos comparáveis) ou ⚠️ BARATO DEMAIS (menos da metade: o
   golpe clássico de aluguel). Temporada/diária, ponto comercial, vaga em
@@ -103,6 +106,6 @@ para aceitar só conexões da própria máquina). Segredos ficam só no `.env`
 ## Testes
 
 ```bash
-./venv/bin/python test_offline.py      # 99 testes de regressão (não usam rede nem o banco real)
+./venv/bin/python test_offline.py      # 101 testes de regressão (não usam rede nem o banco real)
 ./venv/bin/python test_live_olx.py     # canário contra a OLX real (layout, RSC, ordem, aluguel)
 ```
