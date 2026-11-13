@@ -567,7 +567,7 @@ def obter_fila_pendente(limite: int = 5000) -> list[dict]:
                    (SELECT gostou FROM feedback fb WHERE fb.anuncio_id = a.id) AS feedback,
                    b.termo, b.tipo, b.criterios_inclusao, b.criterios_exclusao,
                    b.nome, b.instrucoes, b.condicao, b.categorias, b.preco_max, b.mercado,
-                   b.filtros_extra
+                   b.filtros_extra, b.estado
             FROM fila f
             JOIN anuncios a ON a.id = f.anuncio_id
             JOIN buscas   b ON b.id = f.busca_id
@@ -696,6 +696,14 @@ def reavaliar_cep(busca_id: int, cep: str):
     with get_conn() as conn:
         conn.execute("INSERT OR IGNORE INTO fila (anuncio_id, busca_id, prioridade) "
                      "SELECT id, busca_id, -1 FROM anuncios WHERE busca_id=? AND cep=?", (busca_id, cep))
+
+
+def coords_vizinhas(cep: str):
+    """Centro dos CEPs já localizados com os mesmos 5 primeiros dígitos (None se nenhum)."""
+    with get_conn() as conn:
+        r = conn.execute("SELECT AVG(lat), AVG(lon) FROM locais WHERE chave LIKE ? AND lat IS NOT NULL",
+                         (f"cep:{cep[:5]}%",)).fetchone()
+        return tuple(r) if r and r[0] is not None else None
 
 
 def salvar_coords(chave: str, lat, lon):

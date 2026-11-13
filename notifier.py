@@ -136,7 +136,7 @@ async def enviar_resultado(anuncio: dict, avaliacao: dict) -> bool:
     cabecalho = {"negociar": "🟡 <b>VALE NEGOCIAR</b> — o preço compensa as ressalvas",
                  "suspeita": "⚠️ <b>PECHINCHA SUSPEITA</b> — barato demais, com sinal de golpe: confira antes",
                  "novo": "🏠 <b>NOVO NO SEU FILTRO</b>",
-                 }.get(avaliacao.get("alerta"), "🟢 <b>ABAIXO DO MERCADO</b>" if imovel else f"{_REC_EMOJI.get(rec, '⚪')} <b>{rec}</b>")
+                 }.get(avaliacao.get("alerta"), "🟢 <b>BOA OPÇÃO</b>" if imovel else f"{_REC_EMOJI.get(rec, '⚪')} <b>{rec}</b>")
     if imovel and avaliacao.get("alerta") == "suspeita":
         cabecalho = "⚠️ <b>BARATO DEMAIS</b> — padrão de golpe de aluguel: nunca pague antes de visitar"
     linhas = [

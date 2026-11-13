@@ -777,6 +777,8 @@ _RE_DIVIDIR = re.compile(r"\b(divido|dividir (?:ap|apto|apartamento|casa|aluguel
                          r"quarto em republica|republica (?:feminina|masculina|estudantil|de estudantes)|"
                          r"quarto compartilhado|pensionato|pensao|quarto individual|para (?:1|uma) pessoa|"
                          r"alug\w*(?:-se)? (?:de |um |uma )?(?:quartos?|suites?)(?! e\b))\b")
+_RE_COLETIVO = re.compile(r"\b(?:cozinha|banheiro)s?(?: e \w+)? (?:\w+ )?compartilhad|\bquartos individuais\b|"
+                          r"\bareas comuns compartilhad")
 _CATEGORIA_IMOVEL = {"apartamento": ("apartamentos",), "casa": ("casas",),
                      "quarto": ("aluguel de quartos",), "qualquer": ("apartamentos", "casas")}
 POSITIVOS_IMOVEL = [
@@ -901,6 +903,10 @@ def distancia_km(busca: dict, a: dict):
         return None
     # o CEP (da página do anúncio) dá a rua; sem ele, o centro do bairro
     c = db.coords_local(f"cep:{a['cep']}") if a.get("cep") else None
+    if (not c or c[0] is None) and a.get("cep"):
+        # CEP ainda não localizado (o serviço limita as consultas): os primeiros 5
+        # dígitos são a mesma vizinhança — vale o centro dos CEPs vizinhos já achados
+        c = db.coords_vizinhas(a["cep"])
     if not c or c[0] is None:
         c = db.coords_local(chave) if chave else None
     if not c or c[0] is None:
@@ -957,8 +963,12 @@ def triagem_imovel(busca: dict, a: dict) -> tuple[bool, str]:
         return False, "aluguel por temporada/diária"
     if veta(_RE_COMERCIAL):
         return False, "imóvel comercial"
-    if ex.get("imovel") != "quarto" and veta(_RE_DIVIDIR):
-        return False, "quarto/vaga compartilhada"
+    if ex.get("imovel") != "quarto":
+        if veta(_RE_DIVIDIR) or re.match(r"\W*(?:quartos?|suites?)\b(?! e sala)", ti):
+            return False, "quarto/vaga compartilhada"
+        # a descrição (quando já lida) entrega o quarto em moradia coletiva
+        if _RE_COLETIVO.search(norm(a.get("descricao"))):
+            return False, "quarto com cozinha/banheiro compartilhado"
     return True, ""
 
 
@@ -969,7 +979,7 @@ def resumo_mercado_imovel(anuncios: list[dict]) -> dict | None:
     amostras: dict[str, list] = {}
     for a in anuncios:
         im, total = dados_imovel(a), custo_imovel(a)[0]
-        if total and im["quartos"] is not None and im["cidade"]:
+        if total >= 300 and im["quartos"] is not None and im["cidade"]:      # "R$ 100" é preço de enfeite
             amostras.setdefault(f"{im['cidade']}|{im['bairro']}|{im['quartos']}", []).append(
                 [round(total), im["area"] or 0])
     todos = [t for vs in amostras.values() for t, _ in vs]
@@ -1011,17 +1021,57 @@ def referencia_imovel(item: dict) -> dict | None:
     return None
 
 
+# o que rebaixa a moradia (não é defeito, é o tipo de imóvel) e quem ela aceita
+PRECARIO_IMOVEL = [("barracao", "barracão"), ("nao e sozinha no lote", "divide o lote"),
+                   ("nao e sozinho no lote", "divide o lote"), ("mesmo lote", "divide o lote"),
+                   ("lote compartilhado", "divide o lote"), ("casa de fundo", "casa de fundos"),
+                   ("casa dos fundo", "casa de fundos"), ("barracao de fundo", "casa de fundos"),
+                   ("casa nos fundo", "casa de fundos")]
+_KITNET = ("kitnet", "kitinete", "quitinete", "kitchenette", "kit net")
+RESTRICOES_IMOVEL = [
+    ("para mocas", "só para moças"), ("para mulheres", "só para mulheres"), ("somente mulheres", "só para mulheres"),
+    ("apenas mulheres", "só para mulheres"), ("so mulheres", "só para mulheres"), ("para rapazes", "só para rapazes"),
+    ("casal sem filhos", "só casal sem filhos"), ("sem criancas", "não aceita crianças"),
+    ("nao aceita crianca", "não aceita crianças"), ("nao aceitamos crianca", "não aceita crianças"),
+    ("uma pessoa apenas", "só para 1 pessoa"), ("apenas uma pessoa", "só para 1 pessoa"),
+    ("apenas 1 pessoa", "só para 1 pessoa"), ("somente uma pessoa", "só para 1 pessoa"),
+    ("somente 1 pessoa", "só para 1 pessoa"), ("para uma pessoa", "só para 1 pessoa"), ("para 1 pessoa", "só para 1 pessoa")]
+NOVO_IMOVEL = ("reformad", "recem reformad", "primeira locacao", "nunca habitad", "nunca morou",
+               "apartamento novo", "casa nova", "imovel novo", "predio novo")
+
+
+def custo_m2_imovel(item: dict, total: float):
+    """(R$/m² deste imóvel, 1º quartil, 3º quartil) entre os do filtro com o mesmo nº
+    de quartos na cidade; None sem área ou com menos de 8 pontos."""
+    m, im = item.get("mercado"), dados_imovel(item)
+    am = m.get("amostras") if isinstance(m, dict) else None
+    if not isinstance(am, dict) or not im["area"] or not total or im["quartos"] is None:
+        return None
+    vs = [t / a for k, v in am.items() if k.startswith(f"{im['cidade']}|") and k.endswith(f"|{im['quartos']}")
+          for t, a in v if a]
+    if len(vs) < 8:
+        return None
+    q1, _, q3 = statistics.quantiles(vs, n=4)
+    return total / im["area"], q1, q3
+
+
 def avaliar_imovel(item: dict, texto: str, regras: list, modelo, descartado: str | None) -> dict:
-    """Aluguel/venda de imóvel. Diferente de produto, avisa de TODO anúncio novo
-    que cabe no teto e nos filtros ("novo"): bom aluguel some em horas e o filtro
-    já é estreito; o preço contra a mediana do bairro dá a nota e o destaque."""
+    """Aluguel/venda de imóvel. A nota mede o quanto a moradia VALE dentro do
+    filtro — não o quanto é barata (a 1ª versão premiava só o preço e o topo da
+    lista virou barracão, kitnet e bairro distante):
+      base 5 · cabe no teto +1 · perto do ponto de referência até +2 · entre os mais
+      baratos dos comparáveis +1 (entre os mais caros -1) · bom custo por m² +1
+      (ruim -1) · novo/reformado +1 · mobiliado ou com armários +1 · barracão, lote
+      dividido, kitnet em busca de 2+ quartos -1 cada · restrição de morador -2 ·
+      infiltração/mofo -2 · golpe -3.
+    Com teto, TODO anúncio novo que cabe no filtro avisa; nota 8+ sai como 🟢."""
     titulo, ex, im = item.get("titulo") or "", _extras(item), dados_imovel(item)
     venda = ex.get("negocio") == "venda"
     desc = (item.get("descricao") or "").strip()
     sem_desc = desc in ("", "(sem descrição)")
     preco, teto = item.get("preco") or 0, item.get("preco_max") or 0
     total, detalhe, obs = (preco, "", []) if venda else custo_imovel(item, texto)
-    score, pros, contras, motivos = 6, [], [], []
+    score, pros, contras, motivos = 5, [], [], []
 
     ficha = [f"{im[c]} {r}" for c, r in (("quartos", "quarto(s)"), ("area", "m²"), ("vagas", "vaga(s)"))
              if im[c] is not None]
@@ -1031,12 +1081,24 @@ def avaliar_imovel(item: dict, texto: str, regras: list, modelo, descartado: str
                                  ("area_min", "area", "a área")) if ex.get(ch) and im[c] is None]
     if faltam:
         obs.append(f"Não informa {', '.join(faltam)} — confirme antes de visitar")
-    if ex.get("centro"):
-        if (d := distancia_km(item, item)) is not None:
-            pros.append(f"a ~{d:.1f} km do seu ponto de referência".replace(".", ","))
-        elif ex.get("raio_km"):
-            obs.append("Não foi possível medir a distância deste bairro — confira no mapa")
 
+    # ── onde ──
+    sem_distancia = False
+    if ex.get("centro"):
+        d, raio = distancia_km(item, item), ex.get("raio_km") or 0
+        if d is not None:
+            pros.append(f"a ~{d:.1f} km do seu ponto de referência".replace(".", ","))
+            perto = 2 if d <= (0.4 * raio if raio else 2) else 1 if d <= (0.7 * raio if raio else 4) else 0
+            if perto:
+                score += perto
+                motivos.append("bem perto" if perto == 2 else "perto")
+        elif raio:
+            # raio é para valer: sem conseguir medir, aparece no painel mas não avisa
+            sem_distancia = True
+            obs.append("Não foi possível medir a distância — confira no mapa")
+            motivos.append("distância não confirmada")
+
+    # ── o imóvel ──
     # "sem problemas de infiltração ou mofo": o 2º item da lista herda o "sem"
     probs = [r for ch, r in dict(PROBLEMAS_IMOVEL).items() if afirmado(texto, ch) and not re.search(
         rf"\b(?:sem|nao|nenhum\w*)\b[^.;!\n]{{0,40}}(?:\bou|\bnem|,)\s+(?:de\s+)?{ch}", texto)]
@@ -1045,6 +1107,18 @@ def avaliar_imovel(item: dict, texto: str, regras: list, modelo, descartado: str
         score -= 2
         contras += [f"⚠️ {r}" for r in probs]
         motivos.append(f"ressalva: {', '.join(probs)}")
+    precario = list(dict.fromkeys(r for ch, r in PRECARIO_IMOVEL if afirmado(texto, ch)))
+    if (ex.get("quartos_min") or 0) >= 2 and any(afirmado(texto, k) for k in _KITNET):
+        precario.append("kitnet")              # "kitnet de 2 quartos": cômodos pequenos
+    if precario:
+        score -= min(2, len(precario))
+        contras += precario
+        motivos.append(", ".join(precario))
+    restricoes = list(dict.fromkeys(r for ch, r in RESTRICOES_IMOVEL if afirmado(texto, ch)))
+    if restricoes:
+        score -= 2
+        contras += [f"🚫 {r}" for r in restricoes]
+        motivos.append("restrição de morador")
     golpe, _ = _achados(re.sub(r"[^.!?\n]*\b(?:cuidado|golpe|desconfie|atencao)\b[^.!?\n]*", " ", texto),
                         GOLPE_IMOVEL, [])
     if golpe:
@@ -1054,7 +1128,13 @@ def avaliar_imovel(item: dict, texto: str, regras: list, modelo, descartado: str
     positivos, negados = _achados(texto, POSITIVOS_IMOVEL, [])
     if "semimobiliado" in positivos and "mobiliado" in positivos:
         positivos.remove("mobiliado")
-    pros += positivos[:5]        # informam, não pontuam: piscina e elevador estão em quase todo anúncio
+    if any(afirmado(texto, k) for k in NOVO_IMOVEL):
+        score += 1
+        pros.append("novo ou reformado")
+        positivos = [p for p in positivos if p != "reformado"]
+    if {"mobiliado", "semimobiliado", "armários"} & set(positivos):
+        score += 1
+    pros += positivos[:5]        # piscina, elevador etc. informam; só mobília/armários pontuam
     contras += [_NEGADOS_IMOVEL[n] for n in negados if n in _NEGADOS_IMOVEL]
     garantias = [r for ch, r in GARANTIAS_IMOVEL if afirmado(texto, ch)]
     if afirmado(texto, "fiador") is False:
@@ -1077,7 +1157,7 @@ def avaliar_imovel(item: dict, texto: str, regras: list, modelo, descartado: str
     if sem_desc:
         obs.append("Sem descrição — confirme o estado e as condições")
 
-    # ── preço: teto do usuário sobre o TOTAL; mediana do bairro (ou da cidade) ──
+    # ── preço: teto sobre o TOTAL; posição entre os comparáveis do filtro; R$/m² ──
     r = referencia_imovel(item) or {}
     ref, n, escopo = r.get("mediana"), r.get("n", 0), r.get("escopo", "")
     pct = round((total - ref) / ref * 100) if ref and total else None
@@ -1085,9 +1165,11 @@ def avaliar_imovel(item: dict, texto: str, regras: list, modelo, descartado: str
     # barato demais = bem abaixo do PISO dos comparáveis (60% do 10º percentil), não
     # um % da mediana: kitnet de 650 num bairro de flats de 2.600 é real, e saía ⚠️
     piso = 0.6 * (r.get("p10") or r.get("min") or 0)
+    acima_do_teto = False
     if not total:
         obs.append("Preço a combinar")
     elif teto and total > teto:
+        acima_do_teto = True
         acima = round((total - teto) / teto * 100)
         if preco <= teto:
             obs.append(f"O aluguel cabe no seu teto, mas com condomínio/IPTU o total passa {acima}%")
@@ -1096,30 +1178,37 @@ def avaliar_imovel(item: dict, texto: str, regras: list, modelo, descartado: str
             obs.append(f"Total {acima}% acima do seu teto, mas aceita proposta")
             motivos.append("negociável até o seu teto")
         elif total <= teto * (1 + MARGEM_SILENCIOSA):
-            score, avp = score - 1, "caro"
+            avp = "caro"
             motivos.append(f"total {acima}% acima do seu teto")
         else:
             score, avp = min(score - 2, 4), "caro"
             motivos.append(f"total {acima}% acima do seu teto de {_brl(teto)}")
-    elif pct is not None:
-        if total < piso and pct < -40:
-            avp, suspeita = "suspeito", True        # avisa com ⚠️ (nota no máx. 7): pode ser real
-            obs.append(f"{-pct}% abaixo da mediana {onde} ({_brl(ref)}): aluguel barato demais é o golpe "
-                       "mais comum — nunca pague nada antes de visitar o imóvel")
-            motivos.append("preço suspeito")
-        elif total <= r["q1"] and pct <= -5:
-            # entre os 25% mais baratos dos comparáveis (os 10%: destaque maior)
-            score, avp = score + (3 if r["p10"] and total <= r["p10"] else 2), "bom"
-            motivos.append(f"{-pct}% abaixo da mediana {onde}: entre os mais baratos dos comparáveis")
-        elif total <= r["q3"]:
-            score, avp = score + (1 if teto else 0), "justo"
-            motivos.append(f"preço normal {onde} ({pct:+d}%)")
-        else:
-            avp = "caro"
-            motivos.append(f"{pct}% acima da mediana {onde}: entre os mais caros dos comparáveis")
-    elif teto:
-        score += 1
-        motivos.append(f"dentro do seu teto de {_brl(teto)}, sem referência de mercado")
+    else:
+        if teto:
+            score += 1
+        if pct is not None:
+            # ...ou 70% abaixo da mediana (R$ 250 por um flat: preço de enfeite ou isca)
+            if (total < piso and pct < -40) or pct <= -70:
+                avp, suspeita = "suspeito", True        # avisa com ⚠️ (nota no máx. 7): pode ser real
+                obs.append(f"{-pct}% abaixo da mediana {onde} ({_brl(ref)}): aluguel barato demais é o golpe "
+                           "mais comum — nunca pague nada antes de visitar o imóvel")
+                motivos.append("preço suspeito")
+            elif total <= r["q1"] and pct <= -5:
+                score, avp = score + 1, "bom"
+                motivos.append(f"{-pct}% abaixo da mediana {onde}")
+            elif total <= r["q3"]:
+                avp = "justo"
+                motivos.append(f"preço normal {onde} ({pct:+d}%)")
+            else:
+                score, avp = score - 1, "caro"
+                motivos.append(f"{pct}% acima da mediana {onde}")
+        if not venda and (m2 := custo_m2_imovel(item, total)):
+            if m2[0] <= m2[1]:
+                score += 1
+                pros.append(f"bom custo por m² ({_brl(m2[0])}/m²)")
+            elif m2[0] >= m2[2]:
+                score -= 1
+                contras.append(f"caro por m² ({_brl(m2[0])}/m²)")
 
     if modelo:
         delta, porque = modelo.ajuste({**item, "avaliacao_preco": avp})
@@ -1131,22 +1220,27 @@ def avaliar_imovel(item: dict, texto: str, regras: list, modelo, descartado: str
         pros.insert(0, "você marcou 👍")
         if descartado:
             obs.append(f"As regras descartariam ({descartado}) — mantido pelo seu 👍")
-    if probs or sem_desc or suspeita:
+    if probs or sem_desc or suspeita or restricoes:
         score = min(score, 7)
+    if precario and not (probs or restricoes or golpe or acima_do_teto):
+        score = max(score, 5)        # barracão no orçamento desce na lista, mas não some
+    if sem_distancia:
+        score = min(score, 6)
     if golpe:
         score = min(score, 4)
     score = max(1, min(10, score))
-    rec = "COMPRAR" if score >= 8 and avp == "bom" else "VER" if score >= 5 else "IGNORAR"
+    rec = "COMPRAR" if score >= 8 and not acima_do_teto else "VER" if score >= 5 else "IGNORAR"
     cabe = bool(total) and (not teto or total <= teto)
-    alerta = ("" if golpe or rec == "IGNORAR"
+    # restrição de morador (só moças, só 1 pessoa, sem crianças): aparece, não avisa
+    alerta = ("" if golpe or rec == "IGNORAR" or sem_distancia or restricoes
               else "suspeita" if suspeita
-              else "negociar" if avp == "negociavel" or (avp == "bom" and probs)
-              else "comprar" if avp == "bom"
+              else "negociar" if avp == "negociavel"
+              else "comprar" if rec == "COMPRAR" and (teto or avp == "bom")
               else "novo" if teto and cabe
               else "")
     base = (f" ({pct:+d}% vs mediana {onde} {_brl(ref)}, {n} imóveis"
             + (" de tamanho parecido)" if r.get("tamanho") else ")") if pct is not None
-            else " (sem referência de mercado)")
+            else " (sem referência de preço)")
     custo = f"{_brl(total)}" + ("" if venda else "/mês") + (f" ({detalhe})" if " + " in detalhe else "")
     return Avaliacao(
         decisao="APROVADO", resumo=f"{titulo[:70]} — {custo}{base}",

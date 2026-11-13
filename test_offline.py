@@ -3148,7 +3148,7 @@ def test_p13_aluguel_avaliacao():
     golpe = avaliar(item(aluguel=1750, descricao=desc + " Estou no exterior, envio as chaves pelos correios."), [])
     assert golpe["alerta"] == "" and golpe["recomendacao"] == "IGNORAR" and "golpe" in golpe["motivo"], golpe
     mofo = avaliar(item(aluguel=1750, descricao=desc + " Tem infiltração no banheiro."), [])
-    assert mofo["alerta"] == "negociar" and "⚠️ infiltração" in mofo["contras"], mofo
+    assert mofo["alerta"] == "novo" and mofo["score"] <= 7 and "⚠️ infiltração" in mofo["contras"], mofo
     assert avaliar(item(descricao=desc + " Sem infiltração."), [])["contras"] == []
     gar = avaliar(item(descricao=desc + " Exige fiador ou seguro fiança."), [])
     assert "Garantia pedida: fiador, seguro-fiança" in gar["observacoes"], gar
@@ -3166,7 +3166,22 @@ def test_p13_aluguel_avaliacao():
     assert avaliar(item(titulo="Apartamento por temporada"), [])["motivo"] == "aluguel por temporada/diária"
     assert avaliar(item(feedback=0), [])["decisao"] == "EXCLUIDO"
     sem_desc = avaliar(item(aluguel=1750, descricao=""), [])
-    assert sem_desc["score"] <= 7 and sem_desc["alerta"] == "comprar", sem_desc      # a fila só envia com a descrição
+    assert sem_desc["score"] <= 7 and sem_desc["alerta"] == "novo", sem_desc         # a fila só envia com a descrição
+    # a nota mede o quanto a moradia VALE, não só o preço (a 1ª versão punha barracão e kitnet no topo)
+    sem = "Apartamento de 2 quartos, sala ampla e uma vaga de garagem coberta. Prédio com elevador e portaria 24 horas."
+    simples = avaliar(item(aluguel=2250, descricao=sem), [])
+    barracao = avaliar(item(aluguel=2250, descricao=sem + " Barracão nos fundos, não é sozinha no lote."), [])
+    assert barracao["score"] == 5 < simples["score"] and barracao["contras"] == ["barracão", "divide o lote"], barracao
+    assert barracao["alerta"] == "novo"                                       # desce na lista, mas não some
+    mocas = avaliar(item(aluguel=2250, descricao=sem + " Somente para moças."), [])
+    assert mocas["alerta"] == "" and "🚫 só para moças" in mocas["contras"], mocas
+    assert "kitnet" in avaliar(item(aluguel=2250, titulo="Kitnet com 2 quartos", descricao=sem), [])["contras"]
+    otimo = avaliar(item(aluguel=2250, descricao=sem + " Todo reformado e mobiliado."), [])
+    assert otimo["recomendacao"] == "COMPRAR" and otimo["alerta"] == "comprar" and "novo ou reformado" in otimo["pros"], otimo
+    flat = avaliar(item(aluguel=250, condominio="", iptu=""), [])            # preço de enfeite ou isca
+    assert flat["alerta"] == "suspeita", flat
+    # custo por m²: 60 m² a 2.350 (R$ 39/m²) entre os de 60 m² a 2.400-3.300 e os de 120 m² a ~5.300 (R$ 44/m²)
+    assert any("bom custo por m²" in p for p in barato["pros"]), barato["pros"]
     # venda: o preço é o total, sem "/mês"
     venda = avaliar({**item(negocio="Venda", aluguel=300000, preco_max=400000, mercado=""),
                      "filtros_extra": {**_BUSCA_AP["filtros_extra"], "negocio": "venda"}}, [])
@@ -3191,7 +3206,7 @@ def test_p13_aluguel_ponta_a_ponta():
                            size="60m²", rooms="2", garage_spaces="1") for i in range(10)]
     busca = [_imovel_olx(9001, "Apartamento 2 quartos no Bairro Um", 1750, condominio="R$ 500", iptu="R$ 100",
                          size="60m²", rooms="2", garage_spaces="1"),
-             _imovel_olx(9002, "Apartamento 2 quartos reformado", 2250, condominio="R$ 500", iptu="R$ 100",
+             _imovel_olx(9002, "Apartamento 2 quartos amplo", 2250, condominio="R$ 500", iptu="R$ 100",
                          size="62m²", rooms="2", garage_spaces="1"),
              _imovel_olx(9003, "Apartamento em outro bairro", 1800, local="Cidade Alfa, Bairro Nove", rooms="2",
                          garage_spaces="1"),
@@ -3213,11 +3228,11 @@ def test_p13_aluguel_ponta_a_ponta():
     an = {r[0]: r[1:] for r in sql("SELECT a.titulo, an.decisao, an.alerta, an.avaliacao_preco FROM analises an "
                                    "JOIN anuncios a ON a.id = an.anuncio_id")}
     assert an["Apartamento 2 quartos no Bairro Um"] == ("APROVADO", "comprar", "bom"), an
-    assert an["Apartamento 2 quartos reformado"] == ("APROVADO", "novo", "justo"), an
+    assert an["Apartamento 2 quartos amplo"] == ("APROVADO", "novo", "justo"), an
     assert an["Apartamento por temporada"][0] == "EXCLUIDO", an
     alertas = [t for t in textos if "Ver anúncio" in t]
     assert len(alertas) == avaliador.MAX_ALERTAS, textos                     # o melhor primeiro; o resto no /top
-    assert "ABAIXO DO MERCADO" in alertas[0] and "R$ 2.350/mês (aluguel R$ 1.750 + cond. R$ 500 + IPTU R$ 100)" in alertas[0]
+    assert "BOA OPÇÃO" in alertas[0] and "R$ 2.350/mês (aluguel R$ 1.750 + cond. R$ 500 + IPTU R$ 100)" in alertas[0]
     assert "vs mediana do bairro" in alertas[0] and "📦" not in alertas[0] and "direto com o proprietário" in alertas[0]
     assert sum("NOVO NO SEU FILTRO" in t for t in alertas) == 2, alertas     # 3 baratos + 2 a preço normal
     # rodada seguinte: nada novo, nenhum alerta repetido; o mercado não é remedido no mesmo dia
@@ -3338,6 +3353,12 @@ def test_p13_revisao_independente():
               "Aluguel para 1 pessoa, com água inclusa", "Quarto individual com banheiro"):
         assert not tri(t)[0], t
     assert tri("Alugo quarto", imovel="quarto") != (False, "quarto/vaga compartilhada")
+    for t in ("QUARTOS MOBILIADOS PRÓXIMO À FACULDADE", "Quarto suíte n° 2 para locação", "Suíte prática com banheiro privativo"):
+        assert not tri(t)[0], t
+    assert tri("Quarto e sala no centro")[0]
+    coletivo = {**_ap(titulo="Kitnet mobiliada com tudo incluso"), "descricao": "Unidades com cozinha e lavanderia compartilhadas."}
+    assert avaliador.triagem({"tipo": "imovel", "termo": "", "filtros_extra": {}}, coletivo) == \
+        (False, "quarto com cozinha/banheiro compartilhado")
     for t in ("Aluga-se apartamento 2 quartos mobiliado", "Aluguel de apartamento com 1 quarto e suíte", "Alugo kitnet"):
         assert tri(t)[0], t
     # kitnet barata num bairro de flats não é golpe: só bem abaixo do PISO dos comparáveis
@@ -3479,7 +3500,7 @@ def test_p13_aluguel_raio_e_quartos_max():
                           "criterios_exclusao": [], **a, "descricao": "Kitnet reformada, com armários e uma vaga de garagem coberta, perto de tudo."}
         assert "a ~2,2 km do seu ponto de referência" in avaliar(item(ads[0]), [])["pros"]
         # o CEP da página do anúncio dá a rua: vale mais que o centro do bairro
-        ceps, mapa_cep = [], {"74000001": (-10.2, -50.0), "74000002": (-10.01, -50.0), "74000003": (-25.0, -50.0)}
+        ceps, mapa_cep = [], {"74000001": (-10.2, -50.0), "74000002": (-10.01, -50.0), "75000003": (-25.0, -50.0)}
         def geo_cep(cep):
             ceps.append(cep)
             return mapa_cep.get(cep, (None, None))
@@ -3487,15 +3508,23 @@ def test_p13_aluguel_raio_e_quartos_max():
         try:
             assert scheduler._extrair_cep('{"postalCode":"74000-001"}') == scheduler._extrair_cep('"zipcode": "74000001",') == "74000001"
             assert scheduler._extrair_cep("<html>sem cep</html>") == ""
-            for cep in ("74000001", "74000001", "74000002", "74000003", "74000004", ""):
+            for cep in ("74000001", "74000001", "74000002", "75000003", "75000004", ""):
                 rodar(scheduler._geocodificar_cep(b, cep))
-            assert ceps == ["74000001", "74000002", "74000003", "74000004"], ceps          # 1 consulta por CEP
+            assert ceps == ["74000001", "74000002", "75000003", "75000004"], ceps          # 1 consulta por CEP
             longe_pelo_cep = {**ads[0], "cep": "74000001"}                # bairro "perto", rua a 22 km
             assert "raio de 8 km" in avaliador.passa_filtros_imovel(b, longe_pelo_cep)[1]
             assert avaliar(item(longe_pelo_cep), [])["decisao"] == "EXCLUIDO"
             assert "a ~1,1 km do seu ponto de referência" in avaliar(item({**ads[3], "cep": "74000002"}), [])["pros"]
-            for cep in ("74000003", "74000004"):                          # base errada / CEP desconhecido: vale o bairro
+            for cep in ("75000003", "75000004"):                          # base errada / CEP desconhecido: vale o bairro
                 assert "a ~2,2 km do seu ponto de referência" in avaliar(item({**ads[0], "cep": cep}), [])["pros"]
+            # CEP ainda não localizado (serviço no limite): vale o centro dos vizinhos de mesmo prefixo
+            assert db.coords_vizinhas("74000777") == (-10.105, -50.0) and db.coords_vizinhas("76000000") is None
+            assert "a 12 km" in avaliador.passa_filtros_imovel(b, {**ads[0], "cep": "74000777"})[1]
+            # raio é para valer: sem conseguir medir a distância, aparece mas não avisa
+            sem_medida = avaliar(item(ads[3]), [])
+            assert sem_medida["alerta"] == "" and sem_medida["score"] <= 6 and sem_medida["recomendacao"] == "VER", sem_medida
+            perto = avaliar(item(ads[0]), [])
+            assert perto["alerta"] in ("novo", "comprar") and "perto" in perto["motivo"], perto
             # a página do anúncio grava descrição E CEP
             aid, _, _ = db.upsert_anuncio(b["id"], ads[0])
             pag = pagina_anuncio("Kitnet reformada perto de tudo, com armários.").replace("</html>", '<script>{"postalCode":"74000002"}</script></html>')
@@ -3503,6 +3532,7 @@ def test_p13_aluguel_raio_e_quartos_max():
             rodar(scheduler._preencher_descricoes(b))
             assert sql("SELECT cep, descricao FROM anuncios WHERE id=?", aid)[0][:1] == ("74000002",)
             assert db.obter_fila_pendente()[0]["cep"] == "74000002"
+            assert db.obter_fila_pendente()[0]["estado"] == "go"      # sem o estado a fila não achava o bairro no cache
             # CEP lido com o serviço no limite: localizado numa rodada seguinte, e o anúncio reavaliado
             rodar(avaliador.processar_fila(None))
             sql("UPDATE anuncios SET cep='74000009' WHERE id=?", aid)

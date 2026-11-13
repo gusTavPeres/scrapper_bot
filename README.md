@@ -40,13 +40,17 @@ navegador) e avisa no Telegram quando aparece uma oportunidade.
   e tamanho parecido. `perto=latitude,longitude raio=8` limita a um raio (pelo
   CEP da página do anúncio; sem ele, pelo centro do bairro no OpenStreetMap).
   O estoque do 1º scan não vira alerta (fica no `/top`): só o que for anunciado
-  depois. Com teto, todo anúncio novo
-  que cabe nos filtros avisa: 🏠 NOVO NO SEU FILTRO, 🟢 ABAIXO DO MERCADO (entre
-  os 25% mais baratos dos comparáveis) ou ⚠️ BARATO DEMAIS (menos da metade: o
-  golpe clássico de aluguel). Temporada/diária, ponto comercial, vaga em
-  república e quem "procura imóvel" ficam de fora; as regras livres valem
-  ("só mobiliado", "sem fiador", "prefiro varanda"). `negocio=venda` faz o mesmo
-  para imóveis à venda.
+  depois. A nota mede o quanto a moradia vale dentro do filtro, não só o preço:
+  distância do ponto de referência, posição de preço e custo por m² entre os
+  comparáveis, novo/reformado, mobília; barracão, lote dividido, kitnet em busca
+  de 2+ quartos e restrição de morador ("só moças", "só 1 pessoa") descem a nota.
+  Com teto, todo anúncio novo que cabe no filtro avisa: 🟢 BOA OPÇÃO (nota 8+),
+  🏠 NOVO NO SEU FILTRO ou ⚠️ BARATO DEMAIS (golpe clássico de aluguel). Sem
+  conseguir medir a distância num filtro com raio, o anúncio aparece no painel
+  mas não avisa. Temporada/diária, ponto comercial, quarto em moradia coletiva e
+  quem "procura imóvel" ficam de fora; as regras livres valem ("só mobiliado",
+  "sem fiador", "prefiro varanda"). `negocio=venda` faz o mesmo para imóveis à
+  venda.
 - **Mudança de formato da OLX não passa em silêncio:** cada página é conferida
   com o total de anúncios que a própria OLX declara, e 1x/dia uma busca ampla
   confere preço, data, foto, ordem por data e descrição. Se algo quebrar, o
@@ -106,6 +110,6 @@ para aceitar só conexões da própria máquina). Segredos ficam só no `.env`
 ## Testes
 
 ```bash
-./venv/bin/python test_offline.py      # 101 testes de regressão (não usam rede nem o banco real)
+./venv/bin/python test_offline.py      # 102 testes de regressão (não usam rede nem o banco real)
 ./venv/bin/python test_live_olx.py     # canário contra a OLX real (layout, RSC, ordem, aluguel)
 ```
